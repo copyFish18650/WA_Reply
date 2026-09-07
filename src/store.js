@@ -1124,7 +1124,23 @@ class Store {
     return this.upsertContact(chatId, { mode: "auto", needsHuman: false, escalationReason: "", handoffMessageId: "" });
   }
 
+  getQuoteByInboundMessage(chatId, inboundMessageId) {
+    const conversationId = String(chatId || "");
+    const messageId = String(inboundMessageId || "");
+    if (!conversationId || !messageId) return null;
+    const statusPriority = { sent: 4, rejected: 3, approved: 2, pending: 1 };
+    const row = this.state.quotes
+      .filter((quote) => quote.chatId === conversationId && quote.inboundMessageId === messageId)
+      .sort((a, b) => {
+        const priority = (statusPriority[b.status] || 0) - (statusPriority[a.status] || 0);
+        return priority || Number(b.updatedAt || b.createdAt || 0) - Number(a.updatedAt || a.createdAt || 0);
+      })[0];
+    return row ? this.quoteWithLanguage(row) : null;
+  }
+
   createQuote(data) {
+    const existing = this.getQuoteByInboundMessage(data.chatId, data.inboundMessageId);
+    if (existing) return { ...existing, reusedExisting: true };
     const now = Date.now();
     const row = {
       id: this.state.nextQuoteId++,
@@ -1221,18 +1237,22 @@ class Store {
     const index = this.state.quotes.findIndex((item) => item.id === Number(id));
     if (index < 0) return null;
     const [removed] = this.state.quotes.splice(index, 1);
-    const stillLinked = this.state.quotes.some((quote) => quote.inboundMessageId === removed.inboundMessageId);
-    if (!stillLinked) {
-      const message = this.state.messages.find((item) => item.chatId === removed.chatId && item.id === removed.inboundMessageId);
-      if (message?.metadata?.automationState === "quote_pending") {
-        message.metadata = {
-          ...(message.metadata || {}),
-          automationState: "dismissed",
-          automationReason: "报价记录已由人工删除",
-          automationAt: Date.now()
-        };
-        message.updatedAt = Date.now();
-      }
+    const linked = this.state.quotes.filter((quote) => quote.chatId === removed.chatId && quote.inboundMessageId === removed.inboundMessageId);
+    const message = this.state.messages.find((item) => item.chatId === removed.chatId && item.id === removed.inboundMessageId);
+    if (message?.metadata?.automationState === "quote_pending") {
+      const handled = linked.some((quote) => ["sent", "rejected"].includes(quote.status));
+      const stillPending = linked.some((quote) => ["pending", "approved"].includes(quote.status));
+      message.metadata = {
+        ...(message.metadata || {}),
+        automationState: handled ? "replied" : stillPending ? "quote_pending" : "dismissed",
+        automationReason: handled
+          ? "该图片报价已经处理，重复审核记录已删除"
+          : stillPending
+            ? "图片报价仍在等待审核"
+            : "报价记录已由人工删除",
+        automationAt: Date.now()
+      };
+      message.updatedAt = Date.now();
     }
     this.save();
     return this.quoteWithLanguage(removed);

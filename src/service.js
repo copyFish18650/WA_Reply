@@ -1071,10 +1071,13 @@ class SalesService extends EventEmitter {
     }
     if (message.type === "image") {
       const quote = await this.processImage(message, media, mediaError);
+      const alreadyHandled = quote.reusedExisting && ["sent", "rejected"].includes(quote.status);
       return {
-        state: "quote_pending",
-        source: quote.quoteType === "factory_inquiry" ? "factory-inquiry" : "image-quote",
-        reason: quote.quoteType === "factory_inquiry"
+        state: alreadyHandled ? "replied" : "quote_pending",
+        source: alreadyHandled ? "existing-quote" : quote.quoteType === "factory_inquiry" ? "factory-inquiry" : "image-quote",
+        reason: alreadyHandled
+          ? "该图片报价已经处理，已跳过重复建单"
+          : quote.quoteType === "factory_inquiry"
           ? quote.acknowledgementSentMessageId
             ? "共享货源没有可用价格，已告知客户并转人工询厂"
             : "共享货源没有可用价格，已建立询厂任务；为避免错序未越过后续客户消息发送话术"
@@ -1280,6 +1283,8 @@ class SalesService extends EventEmitter {
   }
 
   async processImage(message, media, mediaError = "") {
+    const existing = this.store.getQuoteByInboundMessage(message.chatId, message.id);
+    if (existing) return { ...existing, reusedExisting: true };
     let localMediaPath = message.localMediaPath || "";
     let mediaUrl = message.mediaUrl || "";
     let mimeType = media?.mimeType || message.mimeType || "image/jpeg";
@@ -1339,6 +1344,7 @@ class SalesService extends EventEmitter {
       draftLanguage: localized.language,
       error
     });
+    if (quote.reusedExisting) return quote;
     if (quote.quoteType === "factory_inquiry") {
       if (this.store.hasLaterInbound(message.chatId, message.createdAt, message.id)) {
         quote = this.store.updateQuote(quote.id, {

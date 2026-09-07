@@ -435,6 +435,40 @@ test("图片估价只进入待审核，审批时才发送且防止重复", async
   assert.equal(store.getQuote(pending[0].id).status, "sent");
 });
 
+test("同一张图片并发或补处理时只保留一个报价任务", async (t) => {
+  const { store, service } = fixture(t);
+  const chatId = conversationKey("primary", "quote-idempotent@c.us");
+  store.upsertContact(chatId, { accountId: "primary", accountName: "Manos", providerChatId: "quote-idempotent@c.us", profileName: "Buyer" });
+  const image = store.addMessage({
+    id: "same-quote-image",
+    chatId,
+    accountId: "primary",
+    direction: "inbound",
+    type: "image",
+    body: "How much is this bag?",
+    createdAt: 1000
+  }).message;
+  service.supplier.search = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    return [{ id: "same-product", title: "Matched bag", cost: 200, currency: "CNY", hasPrice: true }];
+  };
+  service.supplier.calculate = () => ({ costMin: 200, costMax: 200, suggestedPrice: 260, currency: "CNY" });
+
+  const media = { data: Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString("base64"), mimeType: "image/jpeg" };
+  const [first, concurrentReplay] = await Promise.all([
+    service.processImage(image, media),
+    service.processImage(image, media)
+  ]);
+  assert.equal(first.id, concurrentReplay.id);
+  assert.equal(store.listQuotes("all", chatId).length, 1);
+
+  store.updateQuote(first.id, { status: "sent", sentMessageId: "sent-once" });
+  const replay = await service.process(image, null, "历史补处理");
+  assert.equal(replay.state, "replied");
+  assert.equal(replay.source, "existing-quote");
+  assert.equal(store.listQuotes("all", chatId).length, 1);
+});
+
 test("微店搜图响应同时保留有价格和无价格候选", () => {
   const supplier = new SupplierSearch(() => ({ quoteMarkup: 1.3, quoteShipping: 0, quoteCurrency: "CNY" }));
   const products = supplier.normalize({
