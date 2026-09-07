@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WA Sales · 智能聊单工作台</title>
+  <link rel="stylesheet" href="/style.css?v=20260907-1" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="nav-rail">
+      <div class="brand-mark" title="WA Sales">W</div>
+      <nav class="primary-nav" aria-label="主导航">
+        <button class="nav-button active" data-view="inbox" title="会话">
+          <svg viewBox="0 0 24 24"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.5 9.6 9.6 0 0 1-4-.9L3 21l1.7-4.5A8.5 8.5 0 1 1 21 11.5Z"/></svg><span>会话</span>
+        </button>
+        <button class="nav-button" data-view="quotes" title="报价审核">
+          <svg viewBox="0 0 24 24"><path d="M7 3h10l3 3v15H4V3h3Zm2 5h6m-6 4h6m-6 4h3"/></svg><span>报价</span><b id="navQuoteBadge" class="nav-badge">0</b>
+        </button>
+        <button class="nav-button" data-view="insights" title="AI 工作记录">
+          <svg viewBox="0 0 24 24"><path d="M9 3h6l1 3 3 1 2 5-2 5-3 1-1 3H9l-1-3-3-1-2-5 2-5 3-1 1-3Zm3 6v6m-3-3h6"/></svg><span>AI</span>
+        </button>
+      </nav>
+      <button class="nav-button nav-bottom" data-view="settings" title="设置">
+        <svg viewBox="0 0 24 24"><path d="M12 8a4 4 0 1 1 0 8 4 4 0 0 1 0-8Zm8 4 2 2-2 4-3-.2-2 2.2V23h-6v-3l-2-2.2-3 .2-2-4 2-2-2-2 2-4 3 .2L9 4V1h6v3l2 2.2 3-.2 2 4-2 2Z"/></svg><span>设置</span>
+      </button>
+    </aside>
+
+    <section class="work-area">
+      <header class="topbar">
+        <div>
+          <h1>智能聊单工作台</h1>
+          <p>WhatsApp 会话 · 本地 AI · 报价审核</p>
+        </div>
+        <div class="topbar-actions">
+          <div class="model-pill"><i id="aiDot"></i><span id="aiStatusText">检测本地模型…</span></div>
+          <button id="syncButton" class="icon-action" title="同步历史">
+            <svg viewBox="0 0 24 24"><path d="M20 7h-6V1m-10 16h6v6M20 7a9 9 0 0 0-15-2L3 7m1 10a9 9 0 0 0 15 2l2-2"/></svg>
+          </button>
+          <button id="connectionButton" class="connection-pill offline">
+            <span class="connection-dot"></span><span id="connectionText">WhatsApp 未连接</span><span class="chevron">⌄</span>
+          </button>
+        </div>
+      </header>
+
+      <div id="connectionPopover" class="connection-popover hidden">
+        <div class="popover-head"><div><strong>WhatsApp 多账号</strong><small id="accountSummary">0 个账号</small></div><button data-close-popover>×</button></div>
+        <div id="connectionDetail" class="connection-detail"></div>
+        <div id="accountList" class="account-list"></div>
+        <button id="addAccountButton" class="primary-button add-account-button">＋ 添加 WhatsApp 账号</button>
+        <p class="risk-note">扫码方式基于 WhatsApp Web 非官方自动化，仅建议内部低频使用。</p>
+      </div>
+
+      <main class="views">
+        <section id="inboxView" class="view active">
+          <div class="inbox-grid">
+            <aside class="conversation-column">
+              <div class="column-title">
+                <div><h2>会话</h2><span id="conversationCount">0 个客户</span></div>
+                <button id="seedButton" class="tiny-button" title="生成预览数据">预览</button>
+              </div>
+              <label class="search-box">
+                <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
+                <input id="conversationSearch" placeholder="搜索客户、号码或消息" />
+              </label>
+              <div class="filter-tabs" id="conversationFilters">
+                <button class="active" data-filter="all">全部</button>
+                <button data-filter="unread">未读</button>
+                <button data-filter="human">待跟进</button>
+                <button data-filter="quote">待报价</button>
+              </div>
+              <div id="conversationList" class="conversation-list"></div>
+            </aside>
+
+            <section class="chat-column">
+              <div id="emptyChat" class="empty-chat">
+                <div class="empty-illustration">
+                  <span></span><span></span><span></span>
+                  <svg viewBox="0 0 64 64"><path d="M54 30a22 22 0 0 1-24 22 25 25 0 0 1-10-2L7 55l4-12A22 22 0 1 1 54 30Z"/><path d="M21 27h22M21 35h14"/></svg>
+                </div>
+                <h2>从一条会话开始</h2>
+              <p>扫码连接后，会自动同步 WhatsApp Web 当前可用的全部历史，并持续接收新消息。</p>
+                <button class="primary-button" data-open-connection>连接 WhatsApp</button>
+              </div>
+              <div id="activeChat" class="active-chat hidden">
+                <header class="chat-header">
+                  <div class="avatar" id="activeAvatar">M</div>
+                  <div class="chat-identity"><strong id="activeName">客户</strong><span><i id="activeAccountName" class="account-name-chip">账号</i> <em id="activePhone">—</em></span></div>
+                  <div class="chat-header-actions">
+                    <span id="handoffReason" class="handoff-reason hidden"></span>
+                    <label class="mode-toggle" title="切换 AI 自动回复或人工接管">
+                      <input id="modeToggle" type="checkbox" />
+                      <span class="toggle-track"><i></i></span>
+                      <b id="modeLabel">AI 自动</b>
+                    </label>
+                  </div>
+                </header>
+                <div id="messageList" class="message-list"></div>
+                <div class="composer">
+                  <div class="composer-tools"><button id="attachmentButton" type="button" title="批量发送图片或视频">＋</button><input id="attachmentInput" type="file" accept="image/jpeg,image/png,image/webp,image/gif,video/mp4,video/webm,video/quicktime,video/x-m4v" multiple hidden><button id="pasteAttachmentButton" class="paste-attachment" type="button" title="直接读取系统剪贴板中的一张或多张图片、视频">粘贴</button><button title="快捷回复">⌁</button><select id="replyLanguage" class="reply-language" title="快捷翻译的目标语言"><option value="auto">自动·客户语言</option><option value="en">英语</option><option value="fr">法语</option><option value="es">西班牙语</option><option value="de">德语</option><option value="it">意大利语</option><option value="pt">葡萄牙语</option><option value="ar">阿拉伯语</option><option value="ru">俄语</option><option value="ja">日语</option><option value="ko">韩语</option></select><button id="translateComposer" class="translate-composer" type="button" title="将输入内容替换为所选语言">翻译替换</button><span>可多选 / Ctrl+V / 拖入媒体</span></div>
+                  <div id="attachmentPreview" class="attachment-preview hidden"></div>
+                  <textarea id="messageInput" rows="3" placeholder="输入回复…"></textarea>
+                  <div class="composer-bottom"><span id="sendHint">人工消息将直接发送</span><button id="sendButton" class="send-button">发送 <kbd>↵</kbd></button></div>
+                </div>
+              </div>
+            </section>
+
+            <aside class="inspector-column">
+              <div id="emptyInspector" class="empty-inspector">选择会话后查看客户信息</div>
+              <div id="activeInspector" class="hidden">
+                <div class="customer-card">
+                  <div class="large-avatar" id="inspectorAvatar">M</div>
+                  <h3 id="inspectorName">客户</h3>
+                  <p id="inspectorPhone">—</p>
+                  <div id="customerLabels" class="label-row"></div>
+                </div>
+                <div class="inspector-tabs"><button class="active" data-inspector-tab="overview">概览</button><button data-inspector-tab="memory">AI 记忆</button><button data-inspector-tab="activity">动态</button></div>
+                <div id="inspectorOverview" data-inspector-panel="overview">
+                  <section class="inspector-section">
+                    <div class="section-head"><h4>跟进状态</h4><span id="modeStatusTag" class="status-tag">AI 自动</span></div>
+                    <div class="detail-list">
+                      <div><span>消息来源</span><b>WhatsApp</b></div>
+                      <div><span>服务账号</span><b id="inspectorAccount">—</b></div>
+                      <div><span>历史记忆</span><b id="historyCount">0 条</b></div>
+                      <div><span>待审报价</span><b id="contactQuoteCount">0 条</b></div>
+                    </div>
+                  </section>
+                  <section class="inspector-section quote-section">
+                    <div class="section-head"><h4>报价审核</h4><button id="openAllQuotes">查看全部</button></div>
+                    <div id="contactQuotes" class="contact-quotes"></div>
+                  </section>
+                  <section class="inspector-section">
+                    <h4>AI 安全策略</h4>
+                    <p class="small-copy">AI 每次回复会检索近期记录和相关旧消息。记录里没有的数字、价格、尺寸会自动转人工。</p>
+                  </section>
+                </div>
+                <div id="inspectorMemory" class="hidden inspector-panel" data-inspector-panel="memory">
+                  <section class="inspector-section memory-hero">
+                    <div class="memory-eyebrow">LONG-TERM MEMORY</div>
+                    <div class="section-head"><h4>这个客户的长期记忆</h4><button id="organizeMemory" class="memory-organize-button" type="button">整理记忆</button></div>
+                    <p class="small-copy">本地模型会提炼故事连续性与重要事实。自动记忆附带原文来源，可编辑、置顶或删除。</p>
+                    <div id="memoryStatus" class="memory-status"><span>尚未整理</span><b>0%</b></div>
+                    <div class="memory-progress-track"><i id="memoryProgressBar"></i></div>
+                    <p id="memoryProgressLabel" class="memory-progress-label">打开后开始读取历史会话</p>
+                    <div id="memoryRuntime" class="memory-runtime-grid"><span>打开此标签后按需读取</span></div>
+                    <div id="memorySignals" class="memory-signals"></div>
+                  </section>
+                  <section class="inspector-section memory-continuity">
+                    <div class="section-head"><h4>故事连续性</h4><span class="tiny-count">上下文</span></div>
+                    <label class="memory-summary-field"><span>当前场景</span><textarea id="memoryCurrentScene" rows="4" maxlength="2000" placeholder="最近正在聊什么、卡在哪一步"></textarea></label>
+                    <label class="memory-summary-field"><span>历史会话摘要</span><textarea id="memoryHistorySummary" rows="7" maxlength="6000" placeholder="客户关系、谈过的商品和对话发展"></textarea></label>
+                    <div class="memory-summary-actions"><small id="memorySummaryMeta">尚未生成</small><button id="saveMemorySummary" type="button">保存修改</button></div>
+                  </section>
+                  <section class="inspector-section">
+                    <div class="section-head"><h4>重要记忆 <span id="customerMemoryCount" class="tiny-count">0</span></h4><button id="rememberLatest" type="button">记住最近需求</button></div>
+                    <form id="memoryForm" class="memory-form">
+                      <select id="memoryType" aria-label="记忆类型"><option value="requirement">客户需求</option><option value="preference">偏好</option><option value="identity">客户资料</option><option value="relationship">关系信息</option><option value="logistics">物流信息</option><option value="event">故事事件</option><option value="note">客服备注</option></select>
+                      <textarea id="memoryText" rows="2" maxlength="500" placeholder="例如：客户只要黑色、尺码 42，喜欢简短回复"></textarea>
+                      <button type="submit">＋ 保存并用于后续回复</button>
+                    </form>
+                    <div id="customerMemoryList" class="customer-memory-list"><div class="inspector-loading">读取记忆中…</div></div>
+                  </section>
+                  <section class="inspector-section">
+                    <div class="section-head"><h4>人工回复经验</h4><span id="learnedMemoryCount" class="tiny-count">0</span></div>
+                    <p class="small-copy memory-help">这里展示该账号从人工回复中学到、且与当前客户最近问题相关的问答。</p>
+                    <div id="learnedMemoryList" class="learned-memory-list"></div>
+                  </section>
+                </div>
+                <div id="inspectorActivity" class="hidden inspector-panel" data-inspector-panel="activity">
+                  <section class="inspector-section activity-head">
+                    <div class="section-head"><h4>客户动态</h4><span id="activityCount" class="tiny-count">0</span></div>
+                    <div id="activityFilters" class="activity-filters"><button class="active" data-activity-filter="all">全部</button><button data-activity-filter="message">消息</button><button data-activity-filter="automation">自动处理</button><button data-activity-filter="quote">报价</button><button data-activity-filter="memory">记忆</button></div>
+                  </section>
+                  <div id="activityList" class="activity-list"><div class="inspector-loading">读取动态中…</div></div>
+                </div>
+              </div>
+            </aside>
+          </div>
+        </section>
+
+        <section id="quotesView" class="view page-view">
+          <div class="page-heading"><div><span class="eyebrow">REVIEW QUEUE</span><h2>报价审核</h2><p>图片搜货生成的价格永远不会自动发出，审核通过后才会发送。</p></div><select id="quoteFilter"><option value="pending">待审核</option><option value="approved">待发送/失败</option><option value="sent">已发送</option><option value="rejected">已驳回</option><option value="all">全部</option></select></div>
+          <div id="quoteBoard" class="quote-board"></div>
+        </section>
+
+        <section id="insightsView" class="view page-view">
+          <div class="page-heading"><div><span class="eyebrow">LOCAL AI</span><h2>本地 AI 运行概览</h2><p>模型在你的电脑上运行，不调用云端模型，不产生云端 Token 费用。</p></div></div>
+          <div class="metrics-grid">
+            <article><span>本地模型</span><strong id="metricAi">检测中</strong><small id="metricAiDetail">—</small></article>
+            <article><span>历史上下文</span><strong id="metricMessages">0</strong><small>已保存的消息</small></article>
+            <article><span>人工介入</span><strong id="metricHuman">0</strong><small>需要客服跟进</small></article>
+            <article><span>报价待审</span><strong id="metricQuotes">0</strong><small>未向客户发送</small></article>
+          </div>
+          <div class="safety-panel">
+            <div class="safety-icon">AI</div><div><h3>上下文不是“训练权重”，而是可核查的本地记忆</h3><p>系统会保存扫码账号的窗口聊天记录。每条新消息到达时，先读取近期对话，再按关键词翻阅相关旧消息，把找到的原文交给本地模型判断。这样可以避免把客户刚才的“这个”“上一款”理解错，也不会把未经核实的信息学成事实。</p></div>
+          </div>
+          <section class="style-section queue-section">
+            <div class="style-section-heading agent-section-heading"><div><span class="eyebrow">ACCOUNT AGENTS</span><h3>账号与智能体</h3><p>账号只负责连接、接管开关和消息队列；人物形象、业务知识与回复风格由绑定的智能体统一管理。</p></div></div>
+            <div id="accountQueueBoard" class="account-queue-board agent-account-board"></div>
+          </section>
+          <section class="style-section">
+            <div class="style-section-heading agent-section-heading"><div><span class="eyebrow">AGENT LIBRARY</span><h3>智能体库</h3><p>一个智能体可以复用到多个 WhatsApp 号；修改共享智能体后，所有绑定账号会一起使用新设定。</p></div><button id="createAgentButton" class="primary-button" type="button">＋ 新建智能体</button></div>
+            <div id="accountStyleBoard" class="account-style-board agent-library-board"></div>
+          </section>
+        </section>
+
+        <section id="settingsView" class="view page-view">
+          <div class="page-heading"><div><span class="eyebrow">CONFIGURATION</span><h2>系统设置</h2><p>连接信息仅保存在这个独立项目的本地 data 目录。</p></div></div>
+          <form id="settingsForm" class="settings-card">
+            <div class="settings-section"><div class="settings-copy"><h3>本地模型</h3><p>当前已配置本机 llama.cpp；也可切换到 Ollama。</p></div><div class="form-grid"><label>模型服务<select name="localAiProvider"><option value="llama.cpp">llama.cpp</option><option value="ollama">Ollama</option></select></label><label>接口地址<input name="localAiBaseUrl" /></label><label>模型名<input name="localAiModel" /></label><label>上下文消息数<input name="contextMessageLimit" type="number" min="10" max="200" /></label></div></div>
+            <div class="settings-section"><div class="settings-copy"><h3>WhatsApp 历史</h3><p>每个已扫码账号分别同步。填写 0 会持续向前翻页，直到取完 WhatsApp Web 当前可用的全部历史。</p></div><div class="form-grid"><label>每会话同步条数（0 = 全部）<input name="historySyncLimit" type="number" min="0" max="5000" /></label><label class="checkbox-label"><input name="ignoreGroups" type="checkbox" /><span>忽略群聊消息</span></label></div></div>
+            <div class="settings-section"><div class="settings-copy"><h3>共享货源搜图</h3><p>搜图结果先生成 CNY 基础价；运费、70%–80% 利润和 EUR/USD/GBP 币种在每条报价中手动选择。</p></div><div class="form-grid"><label class="wide">搜图接口地址<input name="supplierSearchUrl" placeholder="https://supplier.example.com/image-search" /></label><label>API Key<input name="supplierApiKey" type="password" placeholder="留空保留已有值" /></label><label>搜图基础价倍率<input name="quoteMarkup" type="number" min="0.01" max="20" step="0.01" /></label></div></div>
+            <div class="settings-section"><div class="settings-copy"><h3>客服规则</h3><p>这些规则会和历史聊天一起提供给本地模型。</p></div><div class="form-grid"><label>店铺名<input name="businessName" /></label><label class="wide">回复原则<textarea name="businessGuidelines" rows="4"></textarea></label></div></div>
+            <div class="form-actions"><span id="settingsHint"></span><button type="submit" class="primary-button">保存设置</button></div>
+          </form>
+        </section>
+      </main>
+    </section>
+  </div>
+
+  <div id="modal" class="modal hidden" role="dialog" aria-modal="true"><div class="modal-card"><button id="modalClose" class="modal-close">×</button><div id="modalBody"></div></div></div>
+  <div id="toastStack" class="toast-stack"></div>
+  <script src="/app.js?v=20260907-1"></script>
+</body>
+</html>
