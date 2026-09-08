@@ -1907,6 +1907,7 @@ class SalesService extends EventEmitter {
     return {
       session,
       ai: await this.ai.health(),
+      database: this.store.getDatabaseStatus(),
       agents: this.store.listAgents(),
       supplierConfigured: Boolean(process.env.SUPPLIER_IMAGE_SEARCH_URL || this.store.getRuntimeSettings().supplierSearchUrl),
       stats: this.store.stats()

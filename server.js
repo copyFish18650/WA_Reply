@@ -8,14 +8,28 @@ const { SalesService } = require("./src/service");
 const { CurrencyPricing } = require("./src/pricing");
 
 const ROOT = __dirname;
-const DATA_DIR = path.join(ROOT, "data");
+const configuredDataDir = String(process.env.DATA_DIR || "data").trim() || "data";
+const DATA_DIR = path.isAbsolute(configuredDataDir) ? configuredDataDir : path.resolve(ROOT, configuredDataDir);
 const PORT = Number(process.env.PORT) || 3010;
 const HOST = process.env.HOST || "127.0.0.1";
 
-const store = new Store(DATA_DIR);
+const store = new Store(DATA_DIR, {
+  mysql: {
+    host: process.env.MYSQL_HOST || "127.0.0.1",
+    port: Number(process.env.MYSQL_PORT || 3306),
+    user: process.env.MYSQL_USER || "root",
+    password: process.env.MYSQL_PASSWORD || "",
+    database: process.env.MYSQL_DATABASE || "whatsapp_sales_ai",
+    connectionLimit: Number(process.env.MYSQL_CONNECTION_LIMIT || 8),
+    ssl: process.env.MYSQL_SSL === "true" ? {} : undefined
+  }
+});
 const session = new WhatsAppSessionManager({
   authDir: path.join(DATA_DIR, "auth"),
   getSettings: () => store.getRuntimeSettings(),
+  persistence: store,
+  authEncryptionKey: process.env.AUTH_SESSION_ENCRYPTION_KEY || "",
+  backupSyncIntervalMs: Number(process.env.WHATSAPP_SESSION_BACKUP_INTERVAL_MS || 300000),
   autoStart: true
 });
 const service = new SalesService({ store, session, dataDir: DATA_DIR });
@@ -334,9 +348,21 @@ service.on("update", (event) => {
   if (["error", "sync-error"].includes(event.type)) console.error(`[${event.type}] ${event.message || "未知错误"}`);
 });
 
-function shutdown() {
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 3000).unref();
+let shuttingDown = false;
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  server.close();
+  const timeout = setTimeout(() => {
+    try { store.close(); } finally { process.exit(1); }
+  }, 20000);
+  timeout.unref();
+  try {
+    await session.shutdown();
+  } finally {
+    clearTimeout(timeout);
+    try { store.close(); } finally { process.exit(0); }
+  }
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);

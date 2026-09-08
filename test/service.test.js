@@ -1,3 +1,4 @@
+process.env.NODE_ENV = "test";
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("fs");
@@ -15,7 +16,8 @@ const {
   isIdentityQuestion,
   enforceCustomerServiceIdentity
 } = require("../src/local-ai");
-const { AccountSession, messageId, messageFromMe, normalizedType } = require("../src/whatsapp-session");
+const { AccountSession, WhatsAppSessionManager, messageId, messageFromMe, normalizedType } = require("../src/whatsapp-session");
+const unzipper = require("unzipper");
 const { SupplierSearch, aggregateProductFacts } = require("../src/supplier");
 const { calculateFinalQuote } = require("../src/pricing");
 const { MANOS_LEAD_WELCOME, NEW_CUSTOMER_WELCOME, isGreeting } = require("../src/message-policy");
@@ -40,8 +42,11 @@ class FakeSession extends EventEmitter {
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wa-sales-ai-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const store = new Store(root);
+  t.after(() => {
+    store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
   store.updateAccountAutomation("primary", { enabled: true, status: "idle" });
   const session = new FakeSession();
   const service = new SalesService({ store, session, dataDir: root });
@@ -59,7 +64,62 @@ test("历史记录持久化并按中文关键词找回较早上下文", (t) => {
   const context = store.getContext(chatId, "黑色款现在怎么样？");
   assert.equal(context.some((item) => item.id === "old"), true);
   assert.equal(contextKeywords("黑色款现在怎么样？").includes("黑色"), true);
-  assert.equal(new Store(root).listMessages(chatId, { markRead: false }).length, 13);
+  const reopened = new Store(root);
+  try {
+    assert.equal(reopened.listMessages(chatId, { markRead: false }).length, 13);
+  } finally {
+    reopened.close();
+  }
+});
+
+test("旧 JSON 数据首次启动会完整迁移到持久层，后续只从数据库恢复", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wa-mysql-migration-"));
+  let store;
+  let reopened;
+  t.after(() => {
+    reopened?.close();
+    store?.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  const chatId = "primary::legacy-buyer@c.us";
+  const legacy = {
+    version: 17,
+    nextQuoteId: 2,
+    contacts: {
+      [chatId]: {
+        chatId,
+        conversationId: chatId,
+        accountId: "primary",
+        providerChatId: "legacy-buyer@c.us",
+        profileName: "Legacy buyer",
+        updatedAt: 1000,
+        lastMessageAt: 1000
+      }
+    },
+    messages: [{ id: "legacy-message", chatId, accountId: "primary", direction: "inbound", type: "text", body: "Hello", createdAt: 1000, updatedAt: 1000 }],
+    quotes: [],
+    accountStyles: {},
+    agents: {},
+    accountAgentBindings: {},
+    accountAutomation: {},
+    learnedReplies: [],
+    customerMemories: [],
+    conversationMemories: {},
+    settings: { businessName: "Legacy Manos" }
+  };
+  fs.writeFileSync(path.join(root, "state.json"), JSON.stringify(legacy, null, 2), "utf8");
+
+  store = new Store(root);
+  assert.equal(store.getMessage(chatId, "legacy-message").body, "Hello");
+  assert.equal(store.getDatabaseStatus().integrity, "ok");
+  assert.equal(store.getDatabaseStatus().counts.messages, 1);
+  assert.equal(fs.readdirSync(path.join(root, "backups")).some((name) => /^state-pre-mysql-.*\.json$/.test(name)), true);
+  store.close();
+  store = null;
+
+  fs.writeFileSync(path.join(root, "state.json"), JSON.stringify({ ...legacy, contacts: {}, messages: [] }), "utf8");
+  reopened = new Store(root);
+  assert.equal(reopened.getMessage(chatId, "legacy-message").body, "Hello");
 });
 
 test("关键销售节点不调用 AI，直接切换人工", async (t) => {
@@ -743,7 +803,12 @@ test("账号语言风格持久化并注入该账号的 AI 回复", async (t) => 
   assert.equal(receivedStyle.summary.includes("简短友好"), true);
   assert.equal(receivedStyle.rules[0].text, "以 Hi 开场");
   assert.equal(session.sent[0].body, "Hi, how can I help?");
-  assert.equal(new Store(store.dataDir).getAccountStyle("primary").status, "ready");
+  const reopened = new Store(store.dataDir);
+  try {
+    assert.equal(reopened.getAccountStyle("primary").status, "ready");
+  } finally {
+    reopened.close();
+  }
 });
 
 test("人工新增的主营鞋服规则可以直接回答客户且不会否认卖衣服", () => {
@@ -1133,8 +1198,11 @@ test("只有纯招呼触发新客欢迎，带具体需求的消息交给上下�
 
 test("账号 AI 回复默认关闭，新实时消息只进入队列不发送", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wa-account-off-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const store = new Store(root);
+  t.after(() => {
+    store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
   const session = new FakeSession();
   const service = new SalesService({ store, session, dataDir: root });
   assert.equal(store.getAccountAutomation("primary").enabled, false);
@@ -1146,8 +1214,11 @@ test("账号 AI 回复默认关闭，新实时消息只进入队列不发送", a
 
 test("开启账号 AI 后按客户顺序回复，并展示当前客户和下一位", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wa-account-queue-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const store = new Store(root);
+  t.after(() => {
+    store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
   store.updateAccountStyle("primary", { status: "ready", progress: 100, summary: "Use concise English.", rules: [], persona: { gender: "female", business: "General merchandise", tone: "friendly", personality: "patient" } });
   const session = new FakeSession();
   const service = new SalesService({ store, session, dataDir: root });
@@ -1176,8 +1247,11 @@ test("开启账号 AI 后按客户顺序回复，并展示当前客户和下一�
 
 test("同一客户连续多条排队消息合并为一次上下文回复", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wa-account-merge-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const store = new Store(root);
+  t.after(() => {
+    store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
   store.updateAccountStyle("primary", { status: "ready", progress: 100, summary: "Use concise English.", rules: [], persona: { gender: "female", business: "General merchandise", tone: "friendly", personality: "patient" } });
   const session = new FakeSession();
   const service = new SalesService({ store, session, dataDir: root });
@@ -1200,8 +1274,11 @@ test("同一客户连续多条排队消息合并为一次上下文回复", async
 
 test("同一客户连续发送多张商品图会逐张建立报价审核", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wa-multi-product-"));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const store = new Store(root);
+  t.after(() => {
+    store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
   store.updateAccountStyle("primary", { status: "ready", progress: 100, summary: "Use concise English.", rules: [], persona: { completed: true, gender: "female", business: "Fashion", tone: "friendly", personality: "patient" } });
   const session = new FakeSession();
   const service = new SalesService({ store, session, dataDir: root });
@@ -1361,7 +1438,12 @@ test("客户专属记忆可增删改、持久化并实际注入本地 AI 上下�
   const memory = service.createCustomerMemory(chatId, { type: "preference", text: "This customer only wants black products." });
   const updated = service.updateCustomerMemory(chatId, memory.id, { text: "This customer prefers black products and concise replies.", enabled: true });
   assert.match(updated.text, /concise/);
-  assert.equal(new Store(root).listCustomerMemories(chatId).length, 1);
+  const reopened = new Store(root);
+  try {
+    assert.equal(reopened.listCustomerMemories(chatId).length, 1);
+  } finally {
+    reopened.close();
+  }
   let receivedHistory = [];
   service.ai.decide = async (_contact, history) => {
     receivedHistory = history;
@@ -1412,7 +1494,12 @@ test("本地模型会整理故事连续性、保存原文来源并保护人工�
   memories = store.listCustomerMemories(chatId, { includeDisabled: true });
   assert.equal(memories.some((item) => item.source === "human-edited" && item.pinned && /Lena/.test(item.text)), true);
   assert.equal(memories.some((item) => item.source === "ai" && /中号包/.test(item.text)), true);
-  assert.match(new Store(root).getConversationMemory(chatId).historySummary, /日常包/);
+  const reopened = new Store(root);
+  try {
+    assert.match(reopened.getConversationMemory(chatId).historySummary, /日常包/);
+  } finally {
+    reopened.close();
+  }
 });
 
 test("自动提炼记忆注入回复上下文时保持未核实，人工记忆保持已确认", async (t) => {
@@ -1480,6 +1567,101 @@ test("智能体可跨账号复用，复制后可独立编辑并持久化", (t) =
   store.bindAccountAgent("account-b", clone.id);
   store.updateAccountStyle("account-b", { summary: "Independent cloned style." });
   assert.equal(store.getAccountStyle("account-a").summary, "Shared style update.");
-  assert.equal(new Store(root).getAccountStyle("account-b").summary, "Independent cloned style.");
+  const reopened = new Store(root);
+  try {
+    assert.equal(reopened.getAccountStyle("account-b").summary, "Independent cloned style.");
+  } finally {
+    reopened.close();
+  }
   assert.throws(() => store.deleteAgent(sourceAgent.id), /正被/);
+});
+
+test("WhatsApp account registry and workflow checkpoints are persisted for MySQL", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wa-account-db-"));
+  const store = new Store(root);
+  t.after(() => {
+    store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  store.replaceWhatsAppAccounts([
+    { id: "account-one", clientId: "account-one", label: "Sales One", createdAt: 100 }
+  ]);
+  const manager = new WhatsAppSessionManager({
+    authDir: path.join(root, "auth"),
+    getSettings: () => store.getRuntimeSettings(),
+    persistence: store,
+    autoStart: false
+  });
+  assert.equal(manager.getStatus().totalAccounts, 1);
+  assert.equal(manager.getStatus().accounts[0].label, "Sales One");
+
+  const chatId = "account-one::buyer@c.us";
+  store.upsertContact(chatId, {
+    chatId,
+    accountId: "account-one",
+    providerChatId: "buyer@c.us",
+    profileName: "Buyer",
+    needsHuman: true,
+    escalationReason: "payment confirmation",
+    handoffMessageId: "payment-message"
+  });
+  store.addMessage({
+    id: "payment-message",
+    chatId,
+    accountId: "account-one",
+    direction: "inbound",
+    type: "text",
+    body: "How do I pay?",
+    createdAt: 1000,
+    metadata: { automationState: "handoff", automationAt: 1001, automationReason: "payment confirmation" }
+  });
+  const nodes = store.database.listWorkflowNodes(chatId);
+  assert.equal(nodes.some((node) => node.node_type === "human_handoff" && node.status === "pending"), true);
+  assert.equal(nodes.some((node) => node.message_id === "payment-message" && node.status === "handoff"), true);
+});
+
+test("encrypted WhatsApp login archive can be restored from database without the local profile", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wa-auth-db-"));
+  const store = new Store(root);
+  t.after(() => {
+    store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+  store.replaceWhatsAppAccounts([
+    { id: "secure-account", clientId: "secure-account", label: "Secure Sales", createdAt: 100 }
+  ]);
+  const authDir = path.join(root, "auth");
+  const legacyPath = path.join(authDir, "session-secure-account");
+  const indexedDb = path.join(legacyPath, "Default", "IndexedDB");
+  const localStorage = path.join(legacyPath, "Default", "Local Storage", "leveldb");
+  fs.mkdirSync(indexedDb, { recursive: true });
+  fs.mkdirSync(localStorage, { recursive: true });
+  fs.writeFileSync(path.join(indexedDb, "login-state.bin"), "persisted-login-state");
+  fs.writeFileSync(path.join(localStorage, "000001.log"), "persisted-local-storage");
+
+  const key = "11".repeat(32);
+  const authStore = store.createWhatsAppAuthStore({ accountId: "secure-account", authDir, encryptionKey: key });
+  const migration = await authStore.importLegacySession({
+    session: "RemoteAuth-secure-account",
+    profilePath: legacyPath
+  });
+  assert.equal(migration.imported, true);
+  fs.rmSync(legacyPath, { recursive: true, force: true });
+
+  const record = store.database.readWhatsAppSession("RemoteAuth-secure-account");
+  assert.equal(Boolean(record.encrypted), true);
+  assert.notEqual(Buffer.from(record.archive).includes(Buffer.from("persisted-login-state")), true);
+
+  const archivePath = path.join(authDir, "restored.zip");
+  await authStore.extract({ session: "RemoteAuth-secure-account", path: archivePath });
+  const restoredPath = path.join(root, "restored");
+  await new Promise((resolve, reject) => {
+    fs.createReadStream(archivePath)
+      .pipe(unzipper.Extract({ path: restoredPath }))
+      .on("close", resolve)
+      .on("error", reject);
+  });
+  assert.equal(fs.readFileSync(path.join(restoredPath, "Default", "IndexedDB", "login-state.bin"), "utf8"), "persisted-login-state");
+  assert.equal(store.getDatabaseStatus().counts.whatsappSessions, 1);
+  assert.equal(store.getDatabaseStatus().authSessions.encrypted, 1);
 });

@@ -59,13 +59,15 @@ function messageFromMe(message, ownId = "") {
 }
 
 class AccountSession extends EventEmitter {
-  constructor({ accountId, clientId, label, authDir, getSettings, autoStart = false }) {
+  constructor({ accountId, clientId, label, authDir, getSettings, authStore = null, backupSyncIntervalMs = 300000, autoStart = false }) {
     super();
     this.accountId = accountId;
     this.clientId = clientId;
     this.label = label || accountId;
     this.authDir = path.resolve(authDir);
     this.getSettings = getSettings;
+    this.authStore = authStore;
+    this.backupSyncIntervalMs = Math.max(60000, Number(backupSyncIntervalMs || 300000));
     this.client = null;
     this.initializing = null;
     this.recentInbound = new Map();
@@ -187,11 +189,28 @@ class AccountSession extends EventEmitter {
 
   async createClient() {
     this.setState({ status: "starting", message: "正在启动 WhatsApp Web…", qrDataUrl: "", sync: null });
-    const { Client, LocalAuth } = require("whatsapp-web.js");
+    const { Client, LocalAuth, RemoteAuth } = require("whatsapp-web.js");
     const QRCode = require("qrcode");
     const executablePath = browserExecutable();
+    let authStrategy;
+    if (this.authStore) {
+      const sessionName = `RemoteAuth-${this.clientId}`;
+      const legacyPath = path.join(this.authDir, `session-${this.clientId}`);
+      const migration = await this.authStore.importLegacySession({ session: sessionName, profilePath: legacyPath });
+      authStrategy = new RemoteAuth({
+        clientId: this.clientId,
+        dataPath: this.authDir,
+        store: this.authStore,
+        backupSyncIntervalMs: this.backupSyncIntervalMs
+      });
+      if (migration.imported) {
+        this.setState({ authPersistence: { stored: true, migrated: true, sizeBytes: migration.sizeBytes, encrypted: migration.encrypted } });
+      }
+    } else {
+      authStrategy = new LocalAuth({ clientId: this.clientId, dataPath: this.authDir });
+    }
     const client = new Client({
-      authStrategy: new LocalAuth({ clientId: this.clientId, dataPath: this.authDir }),
+      authStrategy,
       puppeteer: {
         headless: true,
         ...(executablePath ? { executablePath } : {}),
@@ -201,6 +220,10 @@ class AccountSession extends EventEmitter {
       takeoverTimeoutMs: 0
     });
     this.client = client;
+
+    client.on("remote_session_saved", () => {
+      this.setState({ authPersistence: { stored: true, backedUpAt: Date.now(), encrypted: Boolean(this.authStore?.key) } });
+    });
 
     client.on("qr", async (qr) => {
       try {
@@ -255,6 +278,13 @@ class AccountSession extends EventEmitter {
 
     try {
       await client.initialize();
+      if (["starting", "authenticated"].includes(this.state.status) && client.pupPage) {
+        const missedReadyEvent = await client.pupPage.evaluate(() => {
+          const socket = window.require?.("WAWebSocketModel")?.Socket;
+          return Boolean(socket?.hasSynced && typeof window.onAppStateHasSyncedEvent === "function" && typeof window.WWebJS === "undefined");
+        }).catch(() => false);
+        if (missedReadyEvent) await client.pupPage.evaluate(() => window.onAppStateHasSyncedEvent());
+      }
     } catch (error) {
       if (this.client === client) this.client = null;
       try { await client.destroy(); } catch (_) {}
@@ -519,15 +549,30 @@ class AccountSession extends EventEmitter {
     }
     return this.getStatus();
   }
+
+  async shutdown() {
+    const client = this.client;
+    if (!client) return;
+    const strategy = client.authStrategy;
+    if (this.authStore && this.state.account?.id && typeof strategy?.storeRemoteSession === "function") {
+      try { await strategy.storeRemoteSession(); } catch (error) { this.emit("session-error", safeError(error)); }
+    }
+    this.client = null;
+    try { await client.destroy(); } catch (_) {}
+  }
 }
 
 class WhatsAppSessionManager extends EventEmitter {
-  constructor({ authDir, getSettings, autoStart = true }) {
+  constructor({ authDir, getSettings, persistence = null, authEncryptionKey = "", backupSyncIntervalMs = 300000, autoStart = true }) {
     super();
     this.authDir = path.resolve(authDir);
     this.getSettings = getSettings;
+    this.persistence = persistence;
+    this.authEncryptionKey = String(authEncryptionKey || "");
+    this.backupSyncIntervalMs = Math.max(60000, Number(backupSyncIntervalMs || 300000));
     this.registryPath = path.join(this.authDir, "accounts.json");
     this.sessions = new Map();
+    this.persistedStatus = new Map();
     fs.mkdirSync(this.authDir, { recursive: true });
     this.registry = this.loadRegistry();
     for (const meta of this.registry) this.addSession(meta, false);
@@ -536,6 +581,13 @@ class WhatsAppSessionManager extends EventEmitter {
 
   loadRegistry() {
     let registry = [];
+    if (this.persistence) {
+      try { registry = this.persistence.listWhatsAppAccounts(); } catch (error) { throw new Error(`读取数据库中的 WhatsApp 账号失败：${error.message}`); }
+      if (Array.isArray(registry) && registry.length) {
+        fs.writeFileSync(this.registryPath, JSON.stringify(registry, null, 2), "utf8");
+        return registry;
+      }
+    }
     const hadRegistry = fs.existsSync(this.registryPath);
     try {
       if (hadRegistry) registry = JSON.parse(fs.readFileSync(this.registryPath, "utf8"));
@@ -554,28 +606,55 @@ class WhatsAppSessionManager extends EventEmitter {
         known.add(clientId);
       }
     }
+    if (this.persistence) this.persistence.replaceWhatsAppAccounts(registry);
     fs.writeFileSync(this.registryPath, JSON.stringify(registry, null, 2), "utf8");
     return registry;
   }
 
   saveRegistry() {
+    if (this.persistence) this.persistence.replaceWhatsAppAccounts(this.registry);
     fs.writeFileSync(this.registryPath, JSON.stringify(this.registry, null, 2), "utf8");
+  }
+
+  persistSessionStatus(status) {
+    if (!this.persistence || !status?.accountId) return;
+    const snapshot = {
+      lastStatus: String(status.status || "offline"),
+      statusMessage: String(status.message || ""),
+      account: status.account || null,
+      sync: status.sync?.finishedAt ? status.sync : null,
+      ...(status.status === "ready" ? { lastConnectedAt: Date.now() } : {})
+    };
+    const signature = JSON.stringify(snapshot);
+    if (this.persistedStatus.get(status.accountId) === signature) return;
+    this.persistedStatus.set(status.accountId, signature);
+    try { this.persistence.updateWhatsAppAccount(status.accountId, snapshot); } catch (error) { this.emit("session-error", safeError(error)); }
   }
 
   addSession(meta, autoStart = false) {
     if (this.sessions.has(meta.id)) return this.sessions.get(meta.id);
+    const authStore = this.persistence?.createWhatsAppAuthStore?.({
+      accountId: meta.id,
+      authDir: this.authDir,
+      encryptionKey: this.authEncryptionKey
+    }) || null;
     const session = new AccountSession({
       accountId: meta.id,
       clientId: meta.clientId,
       label: meta.label,
       authDir: this.authDir,
       getSettings: this.getSettings,
+      authStore,
+      backupSyncIntervalMs: this.backupSyncIntervalMs,
       autoStart
     });
     for (const event of ["history", "history-complete", "message", "outbound", "ack", "session-error", "sync-error"]) {
       session.on(event, (payload) => this.emit(event, payload));
     }
-    session.on("status", () => this.emit("status", this.getStatus()));
+    session.on("status", (status) => {
+      this.persistSessionStatus(status);
+      this.emit("status", this.getStatus());
+    });
     this.sessions.set(meta.id, session);
     return session;
   }
@@ -679,6 +758,10 @@ class WhatsAppSessionManager extends EventEmitter {
 
   async downloadMessageMedia(accountId, messageId) {
     return this.getSession(accountId).downloadMessageMedia(messageId);
+  }
+
+  async shutdown() {
+    await Promise.allSettled([...this.sessions.values()].map((session) => session.shutdown()));
   }
 }
 

@@ -1,6 +1,9 @@
 const fs = require("fs");
 const path = require("path");
 const { isSystemConversation } = require("./message-policy");
+const { MysqlStateDatabase } = require("./database");
+const { TestStateDatabase } = require("./test-state-database");
+const { DatabaseRemoteAuthStore } = require("./database-auth-store");
 
 const DEFAULT_SETTINGS = {
   localAiProvider: "llama.cpp",
@@ -184,19 +187,34 @@ function isMediaPlaceholder(value) {
 }
 
 class Store {
-  constructor(dataDir) {
+  constructor(dataDir, options = {}) {
     this.dataDir = path.resolve(dataDir);
     this.filePath = path.join(this.dataDir, "state.json");
     this.batchDepth = 0;
     this.dirty = false;
     fs.mkdirSync(this.dataDir, { recursive: true });
+    this.database = options.database || (process.env.NODE_ENV === "test" && !options.mysql
+      ? new TestStateDatabase(this.dataDir)
+      : new MysqlStateDatabase({ ...(options.mysql || {
+        host: process.env.MYSQL_HOST,
+        port: process.env.MYSQL_PORT,
+        user: process.env.MYSQL_USER,
+        password: process.env.MYSQL_PASSWORD,
+        database: process.env.MYSQL_DATABASE || "whatsapp_sales_ai",
+        connectionLimit: process.env.MYSQL_CONNECTION_LIMIT,
+        ssl: process.env.MYSQL_SSL === "true" ? {} : undefined
+      }), dataDir: this.dataDir }));
     this.state = this.load();
   }
 
   load() {
+    let source = "database";
     try {
-      if (!fs.existsSync(this.filePath)) return emptyState();
-      const parsed = JSON.parse(fs.readFileSync(this.filePath, "utf8"));
+      let parsed = this.database.loadState();
+      if (!parsed) {
+        source = fs.existsSync(this.filePath) ? "legacy-json" : "empty";
+        parsed = source === "legacy-json" ? JSON.parse(fs.readFileSync(this.filePath, "utf8")) : emptyState();
+      }
       const state = {
         ...emptyState(),
         ...parsed,
@@ -365,13 +383,15 @@ class Store {
         }));
         state.version = 17;
       }
-      if (Number(parsed.version || 0) < 17) fs.writeFileSync(this.filePath, JSON.stringify(state, null, 2), "utf8");
+      this.database.persistState(state);
+      if (source === "legacy-json") this.legacyBackupPath = this.database.backupLegacyJson(this.filePath);
       return state;
     } catch (error) {
-      if (fs.existsSync(this.filePath)) {
+      if (source === "legacy-json" && fs.existsSync(this.filePath)) {
         try { fs.copyFileSync(this.filePath, `${this.filePath}.invalid-${Date.now()}`); } catch (_) {}
       }
-      return emptyState();
+      try { this.database.close(); } catch (_) {}
+      throw new Error(`持久化数据库加载失败：${error.message}`);
     }
   }
 
@@ -380,14 +400,35 @@ class Store {
       this.dirty = true;
       return;
     }
-    const tempPath = `${this.filePath}.tmp`;
-    fs.writeFileSync(tempPath, JSON.stringify(this.state, null, 2), "utf8");
-    try {
-      fs.renameSync(tempPath, this.filePath);
-    } catch (_) {
-      fs.copyFileSync(tempPath, this.filePath);
-      fs.unlinkSync(tempPath);
-    }
+    this.database.persistState(this.state);
+  }
+
+  getDatabaseStatus() {
+    return this.database.status();
+  }
+
+  listWhatsAppAccounts() {
+    return this.database.listWhatsAppAccounts();
+  }
+
+  replaceWhatsAppAccounts(accounts) {
+    return this.database.replaceWhatsAppAccounts(accounts);
+  }
+
+  updateWhatsAppAccount(accountId, patch) {
+    return this.database.updateWhatsAppAccount(accountId, patch);
+  }
+
+  deleteWhatsAppAccount(accountId) {
+    return this.database.deleteWhatsAppAccount(accountId);
+  }
+
+  createWhatsAppAuthStore({ accountId, authDir, encryptionKey = "" }) {
+    return new DatabaseRemoteAuthStore({ database: this.database, dataPath: authDir, accountId, encryptionKey });
+  }
+
+  close() {
+    this.database.close();
   }
 
   batch(callback) {
