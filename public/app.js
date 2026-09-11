@@ -9,7 +9,8 @@ const state = {
   quotes: [],
   quoteFilter: "pending",
   quoteDrafts: {},
-  exchangeRates: { rates: { EUR: 0.13, USD: 0.14, GBP: 0.11 }, date: "", source: "本地备用汇率", fallback: true },
+  quoteSelections: new Set(),
+  exchangeRates: { rates: { GBP: 0.106952, EUR: 0.129032, USD: 0.137931, AUD: 0.215054 }, date: "", source: "本地备用汇率", fallback: true },
   settings: null,
   refreshTimer: null,
   translationBusy: false,
@@ -191,9 +192,58 @@ function renderAccountStyles() {
     const persona = agent.persona || {};
     const boundNames = (agent.accountIds || []).map(accountDisplayName);
     const enabledRules = (agent.rules || []).filter((rule) => rule.enabled !== false).length;
+    const welcomeSteps = agent.welcomeFlow?.enabled === false ? 0 : Number(agent.welcomeFlow?.steps?.length || 0);
     const gender = ({ female: "女性形象", male: "男性形象", neutral: "中性形象" })[persona.gender] || "形象未设定";
-    return `<article class="style-card agent-card" data-agent-id="${escapeHtml(agent.id)}"><div class="style-card-head"><div class="style-card-identity"><span class="agent-avatar">${escapeHtml(avatarText(agent.name))}</span><div><strong>${escapeHtml(agent.name)}</strong><span>${escapeHtml(agent.description || "可复用销售智能体")}</span></div></div><span class="style-state ${escapeHtml(agent.status || "pending")}">${escapeHtml(styleNames[agent.status] || "待完善")}</span></div><div class="agent-chip-row"><span>${escapeHtml(gender)}</span><span>${escapeHtml(persona.tone || "语气未设定")}</span><span>${enabledRules} 条规则</span><span>${Number(agent.sampleCount || 0)} 条历史样本</span></div><div class="agent-card-content"><div><span>业务与角色</span><p>${escapeHtml(persona.business || "尚未填写主营业务")}</p></div><div><span>回复风格</span><p>${escapeHtml(agent.summary || persona.personality || "尚未形成回复风格")}</p></div></div><div class="agent-bound-row"><span>已绑定</span><div>${boundNames.length ? boundNames.map((name) => `<b>${escapeHtml(name)}</b>`).join("") : `<small>暂未绑定账号</small>`}</div></div><div class="style-card-actions agent-card-actions"><button class="reanalyze" data-agent-action="clone" type="button">复制</button><button class="agent-delete" data-agent-action="delete" type="button" ${agent.accountCount ? "disabled" : ""}>删除</button><button class="save-style" data-agent-action="edit" type="button">编辑智能体</button></div></article>`;
+    return `<article class="style-card agent-card" data-agent-id="${escapeHtml(agent.id)}"><div class="style-card-head"><div class="style-card-identity"><span class="agent-avatar">${escapeHtml(avatarText(agent.name))}</span><div><strong>${escapeHtml(agent.name)}</strong><span>${escapeHtml(agent.description || "可复用销售智能体")}</span></div></div><span class="style-state ${escapeHtml(agent.status || "pending")}">${escapeHtml(styleNames[agent.status] || "待完善")}</span></div><div class="agent-chip-row"><span>${escapeHtml(gender)}</span><span>${escapeHtml(persona.tone || "语气未设定")}</span><span>${welcomeSteps ? `首访 ${welcomeSteps} 步` : "首访流程已关闭"}</span><span>${enabledRules} 条规则</span><span>${Number(agent.sampleCount || 0)} 条历史样本</span></div><div class="agent-card-content"><div><span>业务与角色</span><p>${escapeHtml(persona.business || "尚未填写主营业务")}</p></div><div><span>回复风格</span><p>${escapeHtml(agent.summary || persona.personality || "尚未形成回复风格")}</p></div></div><div class="agent-bound-row"><span>已绑定</span><div>${boundNames.length ? boundNames.map((name) => `<b>${escapeHtml(name)}</b>`).join("") : `<small>暂未绑定账号</small>`}</div></div><div class="style-card-actions agent-card-actions"><button class="reanalyze" data-agent-action="export" type="button">导出</button><button class="reanalyze" data-agent-action="clone" type="button">复制</button><button class="agent-delete" data-agent-action="delete" type="button" ${agent.accountCount ? "disabled" : ""}>删除</button><button class="save-style" data-agent-action="edit" type="button">编辑智能体</button></div></article>`;
   }).join("");
+}
+
+async function exportAgentPackage(agent) {
+  const response = await fetch(`/api/agents/${encodeURIComponent(agent.id)}/export`);
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.error || `导出失败 (${response.status})`);
+  }
+  const blob = await response.blob();
+  const link = document.createElement("a");
+  const objectUrl = URL.createObjectURL(blob);
+  link.href = objectUrl;
+  link.download = `${String(agent.name || "agent").replace(/[\\/:*?"<>|]/g, "_")}.wa-agent`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+  toast(`“${agent.name}”已导出，首次接待图片和视频也在文件中`);
+}
+
+function chooseAgentPackage() {
+  const picker = document.createElement("input");
+  picker.type = "file";
+  picker.accept = ".wa-agent,.zip,application/zip";
+  picker.onchange = async () => {
+    const file = picker.files?.[0];
+    if (!file) return;
+    if (file.size > 200 * 1024 * 1024) return toast("智能体文件不能超过 200 MB", "error");
+    const button = $("#importAgentButton");
+    button.disabled = true;
+    button.textContent = "导入中…";
+    try {
+      const result = await api("/api/agents/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/zip" },
+        body: file
+      });
+      await loadStatus();
+      toast(`已导入“${result.agent.name}”，它是未绑定账号的独立智能体`);
+      openAgentEditor(result.agent.id);
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      button.disabled = false;
+      button.textContent = "导入智能体";
+    }
+  };
+  picker.click();
 }
 
 async function loadConversations() {
@@ -848,13 +898,14 @@ function quoteStatusText(status) {
   return ({ pending: "待审核", approved: "发送失败/待重试", sent: "已发送", rejected: "已驳回" })[status] || status;
 }
 
-const quoteCurrencies = ["EUR", "USD", "GBP"];
+const quoteCurrencies = ["GBP", "EUR", "USD", "AUD"];
 const shippingOptions = [90, 150, 180, 300];
 const quoteLanguages = ["zh", "en", "fr", "es", "de", "it", "pt", "ar", "ru", "ja", "ko"];
 const quoteLanguageNames = { zh: "中文", en: "英语", fr: "法语", es: "西班牙语", de: "德语", it: "意大利语", pt: "葡萄牙语", ar: "阿拉伯语", ru: "俄语", ja: "日语", ko: "韩语" };
 
 function clampProfitRate(value) {
-  return Math.min(0.8, Math.max(0.7, Number(value) || 0.75));
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= 0 ? numeric : 0.75;
 }
 
 function calculateQuote(basePriceCny, shippingCny, profitRate, currency) {
@@ -884,8 +935,8 @@ function calculateQuote(basePriceCny, shippingCny, profitRate, currency) {
 function replaceQuoteAmount(text, currency, price) {
   const replacement = `${currency} ${Math.round(price)}`;
   const current = String(text || "").trim();
-  if (/\b(?:CNY|EUR|USD|GBP)\s+\d+(?:\.\d+)?/i.test(current)) {
-    return current.replace(/\b(?:CNY|EUR|USD|GBP)\s+\d+(?:\.\d+)?/i, replacement);
+  if (/\b(?:CNY|GBP|EUR|USD|AUD)\s+\d+(?:\.\d+)?/i.test(current)) {
+    return current.replace(/\b(?:CNY|GBP|EUR|USD|AUD)\s+\d+(?:\.\d+)?/i, replacement);
   }
   return `Dear, the final price for this product is about ${replacement}. How many pieces do you need?`;
 }
@@ -914,26 +965,70 @@ function finalQuoteReply(language, currency, price, facts = {}) {
 }
 
 function factoryInquiryDraft(language) {
-  return language === "zh" ? "好的亲爱的，我会询问一下工厂。" : "Okay dear, I’ll check with the factory for you.";
+  return language === "zh" ? "请稍等，dear，我询问工厂后就为您制作报价单。" : "Please wait a moment, dear. I’ll check with the factory and prepare a quotation for you.";
+}
+
+const multiProductQuoteReplies = {
+  zh: "亲爱的，这是工厂为您所选商品制作的报价单，请您核查。如需调整，请告诉我。",
+  en: "Dear, this is the factory's quotation for the products you selected. Please check it and let me know if anything needs to be adjusted.",
+  fr: "Voici le devis de l’usine pour les produits que vous avez sélectionnés. Merci de le vérifier et de me dire si quelque chose doit être modifié.",
+  es: "Esta es la cotización de la fábrica para los productos que seleccionó. Por favor, revísela y dígame si necesita algún ajuste.",
+  de: "Dies ist das Angebot der Fabrik für die von Ihnen ausgewählten Produkte. Bitte prüfen Sie es und sagen Sie mir, falls etwas angepasst werden soll.",
+  it: "Questo è il preventivo della fabbrica per i prodotti che ha selezionato. La prego di controllarlo e di dirmi se desidera modifiche.",
+  pt: "Esta é a cotação da fábrica para os produtos que você selecionou. Por favor, confira e me avise se precisar de algum ajuste.",
+  ar: "هذا هو عرض سعر المصنع للمنتجات التي اخترتها. يُرجى مراجعته وإخباري إذا كنت ترغب في أي تعديل.",
+  ru: "Это предложение фабрики по выбранным вами товарам. Пожалуйста, проверьте его и сообщите, если нужно что-либо изменить.",
+  ja: "こちらはお選びいただいた商品の工場見積書です。内容をご確認いただき、修正が必要でしたらお知らせください。",
+  ko: "선택하신 상품에 대한 공장 견적서입니다. 확인해 보시고 수정이 필요하면 말씀해 주세요."
+};
+
+function multiProductQuoteReply(language) {
+  return multiProductQuoteReplies[language] || multiProductQuoteReplies.en;
+}
+
+const outOfStockQuoteReplies = {
+  zh: "抱歉亲爱的，这款商品目前缺货。",
+  en: "Sorry dear, this item is currently out of stock.",
+  fr: "Désolée, ce produit est actuellement en rupture de stock.",
+  es: "Lo siento, este producto está agotado actualmente.",
+  de: "Es tut mir leid, dieser Artikel ist derzeit nicht auf Lager.",
+  it: "Mi dispiace, questo articolo è attualmente esaurito.",
+  pt: "Desculpe, este produto está esgotado no momento.",
+  ar: "عذرًا، هذا المنتج غير متوفر حاليًا.",
+  ru: "Извините, этого товара сейчас нет в наличии.",
+  ja: "申し訳ありません。この商品は現在在庫切れです。",
+  ko: "죄송하지만 이 상품은 현재 품절입니다."
+};
+
+function outOfStockQuoteReply(language) {
+  return outOfStockQuoteReplies[language] || outOfStockQuoteReplies.en;
 }
 
 function quoteEditorValues(quote) {
   const saved = state.quoteDrafts[quote.id] || {};
+  const outOfStock = Boolean(saved.outOfStock ?? quote.outOfStock);
   const basePriceCny = saved.basePriceCny ?? quote.basePriceCny ?? (quote.currency === "CNY" ? quote.suggestedPrice : 0);
   const shippingCny = saved.shippingCny ?? quote.shippingCny ?? 90;
   const profitRate = saved.profitRate ?? quote.profitRate ?? 0.75;
   const currency = quoteCurrencies.includes(saved.currency) ? saved.currency : (quoteCurrencies.includes(quote.currency) ? quote.currency : "USD");
   const calculation = calculateQuote(basePriceCny, shippingCny, profitRate, currency);
+  if (saved.suggestedPrice !== undefined || quote.manualPriceOverride) {
+    const persistedPrice = saved.suggestedPrice ?? quote.suggestedPrice;
+    if (Number.isFinite(Number(persistedPrice)) && Number(persistedPrice) >= 0) calculation.suggestedPrice = Math.round(Number(persistedPrice));
+  }
   const replyLanguage = ["auto", ...quoteLanguages].includes(saved.replyLanguage) ? saved.replyLanguage : (["auto", ...quoteLanguages].includes(quote.replyLanguage) ? quote.replyLanguage : "auto");
   const customerLanguage = quoteLanguages.includes(quote.customerLanguage) ? quote.customerLanguage : "en";
   const effectiveLanguage = replyLanguage === "auto" ? customerLanguage : replyLanguage;
-  let draftReply = saved.draftReply ?? (Number(calculation.basePriceCny) > 0
+  let draftReply = saved.draftReply ?? (outOfStock
+    ? quote.draftReply || outOfStockQuoteReply(effectiveLanguage)
+    : Number(calculation.basePriceCny) > 0
     ? Number(quote.exchangeRate) > 0
       ? replaceQuoteAmount(quote.draftReply, calculation.currency, calculation.suggestedPrice)
       : finalQuoteReply(effectiveLanguage === "zh" ? "zh" : "en", calculation.currency, calculation.suggestedPrice, quote.productFacts)
     : quote.draftReply || factoryInquiryDraft(effectiveLanguage));
   let draftLanguage = saved.draftLanguage || quote.draftLanguage || detectQuoteDraftLanguage(draftReply);
   if (["pending", "approved"].includes(quote.status)
+    && !outOfStock
     && Number(calculation.basePriceCny) > 0
     && !saved.draftReply
     && ["zh", "en"].includes(effectiveLanguage)
@@ -942,6 +1037,7 @@ function quoteEditorValues(quote) {
     draftLanguage = effectiveLanguage;
   }
   if (["pending", "approved"].includes(quote.status)
+    && !outOfStock
     && !(Number(calculation.basePriceCny) > 0)
     && !saved.draftReply
     && ["zh", "en"].includes(effectiveLanguage)
@@ -951,11 +1047,13 @@ function quoteEditorValues(quote) {
   }
   return {
     ...calculation,
+    outOfStock,
     replyLanguage,
     customerLanguage,
     effectiveLanguage,
     draftLanguage,
     draftReply,
+    quotationNotes: Array.isArray(saved.quotationNotes) ? saved.quotationNotes : (Array.isArray(quote.quotationNotes) ? quote.quotationNotes : []),
     reviewerNote: saved.reviewerNote ?? (quote.reviewerNote || "")
   };
 }
@@ -981,11 +1079,98 @@ function quoteLanguageOptions(selected, customerLanguage) {
 }
 
 function currencyOptions(selected) {
-  return quoteCurrencies.map((code) => `<option value="${code}" ${selected === code ? "selected" : ""}>${({ EUR: "欧元 EUR", USD: "美元 USD", GBP: "英镑 GBP" })[code]}</option>`).join("");
+  return quoteCurrencies.map((code) => `<option value="${code}" ${selected === code ? "selected" : ""}>${({ GBP: "英镑 / 英语 GBP (£)", EUR: "欧元 / 英语 EUR (€)", USD: "美元 / 英语 USD ($)", AUD: "澳元 / 英语 AUD (A$)" })[code]}</option>`).join("");
 }
 
 function shippingSelectOptions(selected) {
   return shippingOptions.map((price) => `<option value="${price}" ${Number(selected) === price ? "selected" : ""}>CNY ${price}</option>`).join("");
+}
+
+function compatibleQuoteSelection(anchor) {
+  if (!anchor) return [];
+  return state.quotes.filter((quote) => ["pending", "approved"].includes(quote.status)
+    && quote.chatId === anchor.chatId
+    && String(quote.quotationBatchId || quote.id) === String(anchor.quotationBatchId || anchor.id));
+}
+
+function selectedQuoteIdsFor(id) {
+  const anchor = state.quotes.find((quote) => String(quote.id) === String(id));
+  if (!anchor || !state.quoteSelections.has(String(anchor.id))) return anchor ? [Number(anchor.id)] : [];
+  return compatibleQuoteSelection(anchor)
+    .filter((quote) => state.quoteSelections.has(String(quote.id)))
+    .map((quote) => Number(quote.id));
+}
+
+function selectedQuoteIds() {
+  return state.quotes
+    .filter((quote) => ["pending", "approved"].includes(quote.status) && state.quoteSelections.has(String(quote.id)))
+    .map((quote) => Number(quote.id));
+}
+
+function applyQuoteSelection(input, checked) {
+  const quote = state.quotes.find((item) => String(item.id) === String(input?.dataset.quoteSelect));
+  if (!quote || !input) return;
+  input.checked = checked;
+  if (checked) {
+    for (const selectedId of [...state.quoteSelections]) {
+      const selectedQuote = state.quotes.find((item) => String(item.id) === String(selectedId));
+      if (!selectedQuote || selectedQuote.chatId !== quote.chatId || String(selectedQuote.quotationBatchId || selectedQuote.id) !== String(quote.quotationBatchId || quote.id)) {
+        state.quoteSelections.delete(String(selectedId));
+        const previous = $(`[data-quote-select="${selectedId}"]`, $("#quoteBoard"));
+        if (previous) previous.checked = false;
+      }
+    }
+    state.quoteSelections.add(String(quote.id));
+  } else {
+    state.quoteSelections.delete(String(quote.id));
+  }
+}
+
+function updateQuoteSelectionUI() {
+  $$('[data-quote-card]', $("#quoteBoard")).forEach((card) => {
+    const id = card.dataset.quoteCard;
+    const checked = state.quoteSelections.has(String(id));
+    const selectedIds = selectedQuoteIdsFor(id);
+    card.classList.toggle("quote-selected", checked);
+    const status = $("[data-quote-selection-status]", card);
+    if (status) status.textContent = checked ? "已选" : "";
+    const groupReply = $("[data-group-reply-preview]", card);
+    if (groupReply) {
+      if (selectedIds.length > 1) {
+        const quote = state.quotes.find((item) => String(item.id) === String(id));
+        const language = quote ? quoteEditorValues(quote).effectiveLanguage : "en";
+        groupReply.innerHTML = `<b>多商品实际发送文案 · ${escapeHtml(quoteLanguageNames[language] || "客户语言")}</b><span>${escapeHtml(multiProductQuoteReply(language))}</span>${language === "zh" ? "" : `<small>中文意思：${escapeHtml(multiProductQuoteReply("zh"))}</small>`}`;
+        groupReply.classList.remove("hidden");
+      } else {
+        groupReply.classList.add("hidden");
+        groupReply.innerHTML = "";
+      }
+    }
+  });
+  const selectedIds = selectedQuoteIds();
+  const bulkBar = $("[data-quote-bulk-bar]", $("#quoteBoard"));
+  if (!bulkBar) return;
+  const count = selectedIds.length;
+  const outOfStockCount = selectedIds.filter((id) => {
+    const card = document.querySelector(`[data-quote-card="${id}"]`);
+    return Boolean(card?.querySelector("[data-quote-out-of-stock]")?.checked);
+  }).length;
+  const title = $("[data-quote-bulk-title]", bulkBar);
+  const hint = $("[data-quote-bulk-hint]", bulkBar);
+  const preview = $("[data-quote-bulk-action='preview']", bulkBar);
+  const approve = $("[data-quote-bulk-action='approve']", bulkBar);
+  bulkBar.classList.toggle("has-selection", count > 0);
+  if (title) title.textContent = count ? `已选 ${count} 件商品` : "请先勾选要报价的商品";
+  if (hint) hint.textContent = count > 1
+    ? `将合并生成 1 张报价单${outOfStockCount ? `；其中 ${outOfStockCount} 件缺货，不计入总价` : `，底部显示 ${count} 件商品总价`}`
+    : count === 1
+      ? (outOfStockCount ? "报价单仅标注缺货，不显示价格" : "将生成 1 张单商品报价单")
+      : "同一批次可勾选一件或多件商品";
+  if (preview) preview.disabled = count === 0;
+  if (approve) {
+    approve.disabled = count === 0;
+    approve.textContent = count ? `审核并发送 · ${count} 件` : "审核并发送";
+  }
 }
 
 function renderQuotes() {
@@ -998,15 +1183,26 @@ function renderQuotes() {
     if (legacySent) editor.draftReply = quote.draftReply;
     const image = quote.imageMediaUrl && /^\/media\//.test(quote.imageMediaUrl) ? `<img class="quote-image" src="${escapeHtml(quote.imageMediaUrl)}" alt="询价图片">` : `<div class="quote-image">图片待加载</div>`;
     const quoteContact = state.conversations.find((item) => item.chatId === quote.chatId);
-    const priced = Number(editor.basePriceCny || 0) > 0;
+    const outOfStock = Boolean(editor.outOfStock);
+    const priced = !outOfStock && Number(editor.basePriceCny || 0) > 0;
     const allProducts = quote.products || [];
     const productFacts = quote.productFacts || {};
+    const quotationItemCount = Math.max(1, Number(quote.quotationItemCount || 1));
+    const availableBatchCount = compatibleQuoteSelection(quote).length;
+    const quotationGroupLabel = availableBatchCount > 1 ? `<span class="quote-group-badge">同批可选 · ${availableBatchCount} 件商品</span>` : "";
+    const quoteSelection = editable ? `<label class="quote-selection"><input type="checkbox" data-quote-select="${quote.id}" ${state.quoteSelections.has(String(quote.id)) ? "checked" : ""}><span>加入本次报价单</span><b data-quote-selection-status></b></label>` : "";
+    const stockToggle = editable ? `<label class="quote-stock-toggle"><input type="checkbox" data-quote-out-of-stock ${outOfStock ? "checked" : ""}><span>缺货</span></label>` : (outOfStock ? `<span class="quote-stock-badge">缺货</span>` : "");
+    const quotationPreview = quote.quotationMediaUrl
+      ? `<div class="quotation-preview"><a href="${escapeHtml(quote.quotationMediaUrl)}" target="_blank" rel="noopener"><img src="${escapeHtml(quote.quotationMediaUrl)}" alt="Manos 报价单预览" loading="lazy"></a><div><strong>${quotationItemCount > 1 ? `报价单预览 · ${quotationItemCount} 件` : "报价单预览"}</strong><span>${quote.quotationMessageId ? "已发送给客户" : quote.status === "sent" ? "历史补充预览" : "点击图片放大；发送时按最新金额重做"}</span></div></div>`
+      : "";
     const inquiryStatus = quote.acknowledgementSentMessageId
-      ? "已告知客户：好的亲爱的，我会询问一下工厂"
+      ? "已告知客户：请稍等，我询问工厂后就制作报价单"
       : quote.acknowledgementDeferred
         ? "待人工询厂；为避免越过客户后续消息，未自动发送询厂话术"
         : "待人工询厂";
     const products = allProducts.slice(0, 8);
+    const quotationNotes = editor.quotationNotes;
+    const quotationNotesEditor = `<div class="quotation-notes-editor"><div class="quotation-notes-head"><strong>客户备注</strong><span>可删除；下方是中文意思</span></div><div class="quotation-note-list">${quotationNotes.length ? quotationNotes.map((note) => `<div class="quotation-note" data-quotation-note data-note-id="${escapeHtml(note.id)}" data-note-en="${escapeHtml(note.en)}" data-note-zh="${escapeHtml(note.zh)}"><div><b>${escapeHtml(note.en || note.zh)}</b>${note.zh && note.zh !== note.en ? `<span>${escapeHtml(note.zh)}</span>` : ""}</div>${editable ? `<button type="button" data-remove-quotation-note title="删除这条备注">×</button>` : ""}</div>`).join("") : `<div class="quotation-notes-empty">无备注</div>`}</div><div class="quote-stock-note"><b>Out of stock</b><span>中文意思：缺货</span></div></div>`;
     const productCards = products.length ? products.map((product) => {
       const productImageUrl = supplierImageUrl(product.imageUrl);
       const productImage = productImageUrl ? `<img src="${escapeHtml(productImageUrl)}" alt="搜图候选" loading="lazy">` : `<span class="product-image-empty">无图</span>`;
@@ -1015,17 +1211,20 @@ function renderQuotes() {
       const description = String(product.description || "").trim();
       return `<article class="supplier-product">${productImage}<div><strong>${escapeHtml(product.title || "微店同款")}</strong><span>${Number(product.cost || 0) > 0 ? `货源价 ${escapeHtml(product.currency || "CNY")} ${Number(product.cost).toFixed(2)}` : "未提供价格"}</span>${productFact ? `<p class="supplier-product-fact">${escapeHtml(productFact)}</p>` : ""}${description ? `<p class="supplier-product-description" title="${escapeHtml(description)}">${escapeHtml(description)}</p>` : ""}</div>${candidatePrice > 0 && editable ? `<button data-use-product-price="${candidatePrice}">设为基础价 CNY ${candidatePrice.toFixed(2)}</button>` : ""}</article>`;
     }).join("") : `<div class="supplier-empty">共享货源没有返回相似商品</div>`;
-    return `<article class="quote-card" data-quote-card="${quote.id}">
+    return `<article class="quote-card${quote.manualPriceOverride && !outOfStock ? " manual-price" : ""}${state.quoteSelections.has(String(quote.id)) ? " quote-selected" : ""}${outOfStock ? " quote-out-of-stock" : ""}" data-quote-card="${quote.id}" data-customer-language="${escapeHtml(editor.customerLanguage)}" data-in-stock-reply="${escapeHtml(quote.stockPreviousDraftReply || editor.draftReply)}">
       ${image}
-      <div class="quote-summary"><h3>${quote.quoteType === "factory_inquiry" ? "询厂任务" : "报价"} #${quote.id}</h3><p>${escapeHtml(quoteContact?.profileName || quote.chatId.split("::").at(-1).replace(/@.+$/, ""))} · ${escapeHtml(quoteContact?.accountName || "账号")} · ${relativeTime(quote.createdAt)}</p><div class="price ${priced ? "" : "missing"}">${priced ? `${escapeHtml(legacySent ? quote.currency : editor.currency)} ${legacySent ? Number(quote.suggestedPrice) : editor.suggestedPrice}` : "暂无货源价"}</div><p data-quote-formula>${priced ? `${legacySent ? `历史实际发送 ${escapeHtml(quote.currency)} ${Number(quote.suggestedPrice)}；新版试算：` : ""}CNY ${editor.basePriceCny} + 运费 ${editor.shippingCny} + 利润 ${editor.profitCny} = CNY ${editor.subtotalCny}` : escapeHtml(inquiryStatus)}</p>${productFacts.dimensions?.zh ? `<p class="quote-facts"><b>货源规格归集</b>${escapeHtml(productFacts.dimensions.zh)} · ${Number(productFacts.dimensions.evidenceCount || 1)} 条高相似结果一致</p>` : ""}<p data-rate-label>1 CNY = ${editor.exchangeRate} ${escapeHtml(editor.currency)} · ${escapeHtml(state.exchangeRates.source || "实时汇率")}${state.exchangeRates.fallback ? "（备用）" : ""}</p><p>${escapeHtml(quote.supplier || "微店共享货源")} · ${allProducts.length} 个候选</p>${quote.error ? `<p class="quote-error">${escapeHtml(quote.error)}</p>` : ""}</div>
-      <div class="quote-editor" data-draft-language="${escapeHtml(editor.draftLanguage)}"><div class="quote-calculator"><label>基础价（CNY）<input data-field="basePriceCny" data-calc-field type="number" min="0" step="0.01" value="${editor.basePriceCny}" ${editable ? "" : "disabled"}></label><label>运费类型<select data-field="shippingCny" data-calc-field ${editable ? "" : "disabled"}>${shippingSelectOptions(editor.shippingCny)}</select></label><label>利润率（70%–80%）<input data-field="profitPercent" data-calc-field type="number" min="70" max="80" step="1" value="${Math.round(editor.profitRate * 100)}" ${editable ? "" : "disabled"}></label><label>报价币种<select data-field="currency" data-calc-field ${editable ? "" : "disabled"}>${currencyOptions(editor.currency)}</select></label><label>回复语言<select data-field="replyLanguage" data-quote-language ${editable ? "" : "disabled"}>${quoteLanguageOptions(editor.replyLanguage, editor.customerLanguage)}</select></label><label class="final-price-field">最终报价（四舍五入）<input data-field="suggestedPrice" type="number" value="${editor.suggestedPrice}" readonly></label></div><textarea data-field="draftReply" rows="3" ${editable ? "" : "disabled"}>${escapeHtml(editor.draftReply)}</textarea><input data-field="reviewerNote" placeholder="审核备注（客户不可见）" value="${escapeHtml(editor.reviewerNote)}" ${editable ? "" : "disabled"}></div>
-      <div class="quote-actions">${editable ? `<button class="search" data-quote-action="search">重新搜图</button><button class="save" data-quote-action="save">保存修改</button><button class="approve" data-quote-action="approve">审核并发送</button><button class="reject" data-quote-action="reject">驳回</button>` : `<div class="quote-status">${escapeHtml(quoteStatusText(quote.status))}</div>`}<button class="delete" data-quote-action="delete">删除报价</button></div>
-      <div class="supplier-results"><div class="supplier-results-head"><strong>微店搜图结果</strong><span>${priced ? "选择候选基础价后，再选择运费、利润和币种" : "无价格，已转人工询厂"}</span></div><div class="supplier-product-list">${productCards}</div></div>
+      <div class="quote-summary"><h3>${quote.quoteType === "factory_inquiry" ? "询厂任务" : "报价"} #${quote.id} ${quotationGroupLabel}</h3><p>${escapeHtml(quoteContact?.profileName || quote.chatId.split("::").at(-1).replace(/@.+$/, ""))} · ${escapeHtml(quoteContact?.accountName || "账号")} · ${relativeTime(quote.createdAt)}</p><div class="quote-state-controls">${quoteSelection}${stockToggle}</div><div class="price ${priced ? "" : "missing"}">${priced ? `${escapeHtml(legacySent ? quote.currency : editor.currency)} ${legacySent ? Number(quote.suggestedPrice) : editor.suggestedPrice}` : "暂无货源价"}</div><div class="quote-stock-status">缺货</div><p data-quote-formula>${priced ? `${legacySent ? `历史实际发送 ${escapeHtml(quote.currency)} ${Number(quote.suggestedPrice)}；` : ""}成本 ${editor.basePriceCny} + 运费 ${editor.shippingCny} + 利润 ${editor.profitCny}` : escapeHtml(inquiryStatus)}</p><p class="quote-stock-copy">报价单不显示价格，备注栏标注 Out of stock / 缺货</p>${productFacts.dimensions?.zh ? `<p class="quote-facts"><b>规格</b>${escapeHtml(productFacts.dimensions.zh)}</p>` : ""}<details class="quote-meta-details"><summary>货源与汇率</summary><p data-rate-label>1 CNY = ${editor.exchangeRate} ${escapeHtml(editor.currency)} · ${escapeHtml(state.exchangeRates.source || "实时汇率")}${state.exchangeRates.fallback ? "（备用）" : ""}</p><p>${escapeHtml(quote.supplier || "微店共享货源")} · ${allProducts.length} 个候选</p></details>${quote.error ? `<p class="quote-error">${escapeHtml(quote.error)}</p>` : ""}</div>
+      <div class="quote-editor" data-draft-language="${escapeHtml(editor.draftLanguage)}"><div class="quote-calculator quote-quick-calculator"><label class="quote-price-control">运费<select data-field="shippingCny" data-calc-field ${editable ? "" : "disabled"}>${shippingSelectOptions(editor.shippingCny)}</select></label><label class="quote-price-control">币种<select data-field="currency" data-calc-field ${editable ? "" : "disabled"}>${currencyOptions(editor.currency)}</select></label><label>语言<select data-field="replyLanguage" data-quote-language ${editable ? "" : "disabled"}>${quoteLanguageOptions(editor.replyLanguage, editor.customerLanguage)}</select></label><label class="final-price-field quote-price-control">最终价<input data-field="suggestedPrice" data-final-price type="number" min="0" step="1" value="${editor.suggestedPrice}" ${editable ? "" : "disabled"}></label></div><details class="quote-advanced-settings"><summary data-quote-advanced-summary>成本与利润 · CNY ${editor.basePriceCny} / ${Math.round(editor.profitRate * 100)}%</summary><div class="quote-advanced-grid"><label>基础价（CNY）<input data-field="basePriceCny" data-calc-field type="number" min="0" step="0.01" value="${editor.basePriceCny}" ${editable ? "" : "disabled"}></label><label>利润率（可自由编辑）<input data-field="profitPercent" data-calc-field type="number" min="0" step="1" value="${Math.round(editor.profitRate * 100)}" ${editable ? "" : "disabled"}></label></div><input data-field="reviewerNote" placeholder="内部审核备注（客户不可见）" value="${escapeHtml(editor.reviewerNote)}" ${editable ? "" : "disabled"}></details><textarea data-field="draftReply" rows="2" aria-label="发送给客户的文字" placeholder="发送给客户的文字" ${editable ? "" : "disabled"}>${escapeHtml(editor.draftReply)}</textarea><div class="group-reply-preview hidden" data-group-reply-preview></div></div>
+      <div class="quote-actions">${editable ? `<details class="quote-actions-more"><summary>更多操作</summary><div><button class="save" data-quote-action="save">保存修改</button><button class="search" data-quote-action="search">重新搜图</button><button class="reject" data-quote-action="reject">驳回缺货</button><button class="delete" data-quote-action="delete">删除记录</button></div></details>` : `<div class="quote-status">${escapeHtml(quoteStatusText(quote.status))}</div><button class="delete" data-quote-action="delete">删除记录</button>`}</div>
+      ${quotationNotesEditor}
+      ${quotationPreview}
+      <details class="supplier-results"><summary><strong>货源候选 · ${allProducts.length} 个</strong><span>${outOfStock ? "已标记缺货" : priced ? "展开后可更换基础价" : "无价格，已转人工询厂"}</span></summary><div class="supplier-product-list">${productCards}</div></details>
     </article>`;
-  }).join("");
+  }).join("") + (state.quotes.some((quote) => ["pending", "approved"].includes(quote.status)) ? `<div class="quote-bulk-bar" data-quote-bulk-bar><div class="quote-bulk-copy"><strong data-quote-bulk-title>请先勾选要报价的商品</strong><span data-quote-bulk-hint>同一批次可勾选一件或多件商品</span></div><div class="quote-bulk-actions"><button class="quote-bulk-preview" data-quote-bulk-action="preview" disabled>预览报价单</button><button class="quote-bulk-send" data-quote-bulk-action="approve" disabled>审核并发送</button></div></div>` : "");
   $$('[data-field]', board).forEach((field) => field.addEventListener("input", () => {
     const card = field.closest("[data-quote-card]");
     if (field.hasAttribute("data-calc-field")) recalculateQuoteCard(card);
+    if (field.hasAttribute("data-final-price")) applyManualQuotePrice(card);
     state.quoteDrafts[card.dataset.quoteCard] = quotePatch(card);
   }));
   $$('[data-quote-action]', board).forEach((button) => button.addEventListener("click", () => handleQuoteAction(button.closest("[data-quote-card]"), button.dataset.quoteAction)));
@@ -1037,6 +1236,73 @@ function renderQuotes() {
     recalculateQuoteCard(card);
     toast("已带入候选基础价，并重新计算最终报价");
   }));
+  $$('[data-remove-quotation-note]', board).forEach((button) => button.addEventListener("click", () => {
+    const card = button.closest("[data-quote-card]");
+    button.closest("[data-quotation-note]")?.remove();
+    const list = $(".quotation-note-list", card);
+    if (list && !$("[data-quotation-note]", list)) list.innerHTML = `<div class="quotation-notes-empty">已删除全部备注，报价单 Notes 栏将留空</div>`;
+    state.quoteDrafts[card.dataset.quoteCard] = quotePatch(card);
+    toast("该条报价单备注已移除，保存或审核后生效");
+  }));
+  $$('[data-quote-select]', board).forEach((input) => input.addEventListener("change", () => {
+    applyQuoteSelection(input, input.checked);
+    updateQuoteSelectionUI();
+  }));
+  $$('[data-quote-out-of-stock]', board).forEach((input) => input.addEventListener("change", async () => {
+    const card = input.closest("[data-quote-card]");
+    const reply = $("[data-field='draftReply']", card);
+    const selection = $("[data-quote-select]", card);
+    const previousSelection = Boolean(selection?.checked);
+    const previousReply = reply.value;
+    const previousStockState = !input.checked;
+    card.classList.toggle("quote-out-of-stock", input.checked);
+    if (input.checked) {
+      if (!card.dataset.inStockReply) card.dataset.inStockReply = reply.value;
+      const selectedLanguage = $("[data-field='replyLanguage']", card).value;
+      const language = selectedLanguage === "auto" ? card.dataset.customerLanguage : selectedLanguage;
+      reply.value = outOfStockQuoteReply(language);
+      if (selection && !selection.checked) applyQuoteSelection(selection, true);
+    } else if (card.dataset.inStockReply) {
+      reply.value = card.dataset.inStockReply;
+    }
+    const patch = quotePatch(card);
+    state.quoteDrafts[card.dataset.quoteCard] = patch;
+    updateQuoteSelectionUI();
+    input.disabled = true;
+    try {
+      const payload = await api(`/api/quotes/${card.dataset.quoteCard}`, { method: "PATCH", body: JSON.stringify(patch) });
+      const index = state.quotes.findIndex((quote) => String(quote.id) === String(card.dataset.quoteCard));
+      if (index >= 0) state.quotes[index] = payload.quote;
+      delete state.quoteDrafts[card.dataset.quoteCard];
+      toast(input.checked ? "已标记缺货：报价单不显示价格，备注写入缺货" : "已恢复有货报价和价格计算");
+    } catch (error) {
+      input.checked = previousStockState;
+      card.classList.toggle("quote-out-of-stock", previousStockState);
+      reply.value = previousReply;
+      if (selection) applyQuoteSelection(selection, previousSelection);
+      delete state.quoteDrafts[card.dataset.quoteCard];
+      toast(error.message, "error");
+    } finally {
+      input.disabled = false;
+      updateQuoteSelectionUI();
+    }
+  }));
+  $$('[data-quote-bulk-action]', board).forEach((button) => button.addEventListener("click", () => handleSelectedQuoteAction(button.dataset.quoteBulkAction)));
+  updateQuoteSelectionUI();
+}
+
+async function handleSelectedQuoteAction(action) {
+  const selectedIds = selectedQuoteIds();
+  if (!selectedIds.length) {
+    toast("请先勾选要加入报价单的商品", "error");
+    return;
+  }
+  const anchorCard = document.querySelector(`[data-quote-card="${selectedIds[0]}"]`);
+  if (!anchorCard) {
+    toast("未找到已选商品，请刷新后重试", "error");
+    return;
+  }
+  await handleQuoteAction(anchorCard, action);
 }
 
 function recalculateQuoteCard(card) {
@@ -1050,17 +1316,39 @@ function recalculateQuoteCard(card) {
   const priceLabel = $(".quote-summary .price", card);
   priceLabel.classList.toggle("missing", !(calculation.basePriceCny > 0));
   priceLabel.textContent = calculation.basePriceCny > 0 ? `${calculation.currency} ${calculation.suggestedPrice}` : "暂无货源价";
-  if (calculation.basePriceCny > 0) $("[data-quote-formula]", card).textContent = `CNY ${calculation.basePriceCny} + 运费 ${calculation.shippingCny} + 利润 ${calculation.profitCny} = CNY ${calculation.subtotalCny}`;
+  if (calculation.basePriceCny > 0) $("[data-quote-formula]", card).textContent = `成本 ${calculation.basePriceCny} + 运费 ${calculation.shippingCny} + 利润 ${calculation.profitCny}`;
+  const advancedSummary = $("[data-quote-advanced-summary]", card);
+  if (advancedSummary) advancedSummary.textContent = `成本与利润 · CNY ${calculation.basePriceCny} / ${Math.round(calculation.profitRate * 100)}%`;
+  delete $("[data-quote-formula]", card).dataset.formulaBase;
+  card.classList.remove("manual-price");
   $("[data-rate-label]", card).textContent = `1 CNY = ${calculation.exchangeRate} ${calculation.currency} · ${state.exchangeRates.source || "实时汇率"}${state.exchangeRates.fallback ? "（备用）" : ""}`;
   const reply = $("[data-field='draftReply']", card);
   if (calculation.basePriceCny > 0) reply.value = replaceQuoteAmount(reply.value, calculation.currency, calculation.suggestedPrice);
   state.quoteDrafts[card.dataset.quoteCard] = quotePatch(card);
 }
 
+function applyManualQuotePrice(card) {
+  const input = $("[data-field='suggestedPrice']", card);
+  const price = Math.max(0, Math.round(Number(input.value) || 0));
+  const currency = $("[data-field='currency']", card).value;
+  const priceLabel = $(".quote-summary .price", card);
+  priceLabel.classList.toggle("missing", !(price > 0));
+  priceLabel.textContent = price > 0 ? `${currency} ${price}` : "暂无货源价";
+  const formulaLabel = $("[data-quote-formula]", card);
+  const formulaBase = formulaLabel.dataset.formulaBase || formulaLabel.textContent.split("；手动最终报价")[0];
+  formulaLabel.dataset.formulaBase = formulaBase;
+  formulaLabel.textContent = `${formulaBase}；手动最终报价 ${currency} ${price}`;
+  card.classList.add("manual-price");
+  const reply = $("[data-field='draftReply']", card);
+  if (price > 0) reply.value = replaceQuoteAmount(reply.value, currency, price);
+}
+
 function quotePatch(card) {
   const draftReply = $("[data-field='draftReply']", card).value.trim();
+  const outOfStock = Boolean($("[data-quote-out-of-stock]", card)?.checked);
   return {
-    suggestedPrice: Number($("[data-field='suggestedPrice']", card).value),
+    suggestedPrice: outOfStock ? 0 : Math.max(0, Math.round(Number($("[data-field='suggestedPrice']", card).value) || 0)),
+    outOfStock,
     currency: $("[data-field='currency']", card).value.trim(),
     basePriceCny: Number($("[data-field='basePriceCny']", card).value),
     shippingCny: Number($("[data-field='shippingCny']", card).value),
@@ -1070,6 +1358,11 @@ function quotePatch(card) {
     replyLanguage: $("[data-field='replyLanguage']", card).value,
     draftLanguage: detectQuoteDraftLanguage(draftReply),
     draftReply,
+    quotationNotes: $$('[data-quotation-note]', card).map((note) => ({
+      id: note.dataset.noteId,
+      en: note.dataset.noteEn,
+      zh: note.dataset.noteZh
+    })),
     reviewerNote: $("[data-field='reviewerNote']", card).value.trim()
   };
 }
@@ -1091,21 +1384,42 @@ async function translateQuoteLanguage(card, select) {
   }
 }
 
+async function saveSelectedQuoteDrafts(selectedQuoteIds, anchorId) {
+  for (const quoteId of selectedQuoteIds) {
+    if (String(quoteId) === String(anchorId)) continue;
+    const selectedCard = document.querySelector(`[data-quote-card="${quoteId}"]`);
+    if (!selectedCard) continue;
+    await api(`/api/quotes/${quoteId}`, { method: "PATCH", body: JSON.stringify(quotePatch(selectedCard)) });
+    delete state.quoteDrafts[quoteId];
+  }
+}
+
 async function handleQuoteAction(card, action) {
   const id = card.dataset.quoteCard;
   const patch = quotePatch(card);
+  const selectedQuoteIds = selectedQuoteIdsFor(id);
+  const selectedPayload = { ...patch, selectedQuoteIds };
   try {
     if (action === "search") {
       await api(`/api/quotes/${id}/search`, { method: "POST" });
       toast(`报价 #${id} 已重新完成微店搜图`);
+    } else if (action === "preview") {
+      await saveSelectedQuoteDrafts(selectedQuoteIds, id);
+      await api(`/api/quotes/${id}/document`, { method: "POST", body: JSON.stringify(selectedPayload) });
+      toast(selectedQuoteIds.length > 1 ? `已将勾选的 ${selectedQuoteIds.length} 件商品生成一张报价单` : `已生成当前单商品报价单`);
     } else if (action === "save") {
       await api(`/api/quotes/${id}`, { method: "PATCH", body: JSON.stringify(patch) });
       toast(`报价 #${id} 已保存，尚未发送`);
     } else if (action === "approve") {
-      const confirmed = await confirmModal("审核并发送报价", `确认将报价 #${id} 发送给客户？发送后不可撤回。`);
+      const itemCount = selectedQuoteIds.length;
+      const confirmed = await confirmModal("审核并发送报价单", itemCount > 1
+        ? `确认把已勾选的 ${itemCount} 件商品合并成一张报价单发送给客户？每件商品单独列出，底部为整单总价，未勾选商品仍留在待审核。`
+        : `确认只把当前这 1 件商品生成报价单并发送给客户？同批其他未勾选商品仍留在待审核。`);
       if (!confirmed) return;
-      await api(`/api/quotes/${id}/approve`, { method: "POST", body: JSON.stringify(patch) });
-      toast(`报价 #${id} 已审核并发送`);
+      await saveSelectedQuoteDrafts(selectedQuoteIds, id);
+      await api(`/api/quotes/${id}/approve`, { method: "POST", body: JSON.stringify(selectedPayload) });
+      selectedQuoteIds.forEach((quoteId) => state.quoteSelections.delete(String(quoteId)));
+      toast(itemCount > 1 ? `${itemCount} 件已合并为一张报价单发送，未选商品保留待审` : `已只发送当前 1 件商品的报价单`);
     } else if (action === "reject") {
       const confirmed = await confirmModal("驳回并通知缺货", `确认驳回报价 #${id}？系统会立即告诉客户：抱歉亲爱的，这款工厂告诉我暂时缺货。`);
       if (!confirmed) return;
@@ -1168,6 +1482,62 @@ function agentRuleRow(rule = {}) {
   return `<div class="style-rule" data-agent-rule data-rule-id="${escapeHtml(rule.id || `manual-${Date.now()}-${Math.random().toString(16).slice(2)}`)}" data-rule-source="${escapeHtml(rule.source || "manual")}"><input data-rule-enabled type="checkbox" ${rule.enabled === false ? "" : "checked"} aria-label="启用规则"><input data-rule-text value="${escapeHtml(rule.text || "")}" placeholder="例如：客户闲聊时先回应情绪，再自然推进需求"><button data-agent-rule-remove type="button" title="删除规则">×</button></div>`;
 }
 
+function agentWelcomeStepRow(step = {}, index = 0) {
+  const type = ["text", "image", "video"].includes(step.type) ? step.type : "text";
+  const id = step.id || `welcome-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const typeName = { text: "文字", image: "图片", video: "视频" }[type];
+  const preview = type === "image"
+    ? `<img src="${escapeHtml(step.mediaUrl || "")}" alt="首次接待图片">`
+    : type === "video"
+      ? `<video src="${escapeHtml(step.mediaUrl || "")}" controls preload="metadata"></video>`
+      : "";
+  const content = type === "text"
+    ? `<textarea data-welcome-text rows="3" placeholder="输入这一条要发送给新客户的话…">${escapeHtml(step.text || "")}</textarea>`
+    : `<div class="welcome-media-preview">${preview}<div><strong>${escapeHtml(step.filename || typeName)}</strong><span>${typeName}素材 · 会按此位置发送</span></div></div><input data-welcome-caption value="${escapeHtml(step.caption || "")}" placeholder="可选：随${typeName}一起发送的说明文字">`;
+  return `<div class="welcome-step" data-welcome-step data-step-id="${escapeHtml(id)}" data-step-type="${type}" data-media-url="${escapeHtml(step.mediaUrl || "")}" data-mime-type="${escapeHtml(step.mimeType || "")}" data-filename="${escapeHtml(step.filename || "")}"><div class="welcome-step-order"><b data-welcome-order>${index + 1}</b><span>${typeName}</span></div><div class="welcome-step-content">${content}</div><div class="welcome-step-actions"><button data-welcome-move="up" type="button" title="上移">↑</button><button data-welcome-move="down" type="button" title="下移">↓</button><button data-welcome-remove type="button" title="删除">×</button></div></div>`;
+}
+
+function refreshAgentWelcomeOrder(list) {
+  const rows = $$('[data-welcome-step]', list);
+  rows.forEach((row, index) => {
+    $("[data-welcome-order]", row).textContent = index + 1;
+    const up = $('[data-welcome-move="up"]', row);
+    const down = $('[data-welcome-move="down"]', row);
+    if (up) up.disabled = index === 0;
+    if (down) down.disabled = index === rows.length - 1;
+  });
+  $('[data-empty-welcome]', list)?.classList.toggle("hidden", rows.length > 0);
+}
+
+async function addAgentWelcomeMedia(agentId, type, list, button) {
+  const picker = document.createElement("input");
+  picker.type = "file";
+  picker.accept = type === "image" ? "image/jpeg,image/png,image/webp,image/gif" : "video/mp4,video/webm,video/quicktime,video/x-m4v";
+  picker.onchange = async () => {
+    const file = picker.files?.[0];
+    if (!file) return;
+    if (file.size > 35 * 1024 * 1024) return toast("单个招呼素材不能超过 35 MB", "error");
+    button.disabled = true;
+    button.textContent = "上传中…";
+    try {
+      const dataUrl = await readFileAsDataUrl(file);
+      const payload = await api(`/api/agents/${encodeURIComponent(agentId)}/welcome-media`, {
+        method: "POST",
+        body: JSON.stringify({ data: dataUrl, mimeType: file.type, filename: file.name })
+      });
+      list.insertAdjacentHTML("beforeend", agentWelcomeStepRow(payload.asset, $$('[data-welcome-step]', list).length));
+      refreshAgentWelcomeOrder(list);
+      toast(`${type === "image" ? "图片" : "视频"}已加入首次接待流程，保存智能体后生效`);
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      button.disabled = false;
+      button.textContent = type === "image" ? "＋ 图片" : "＋ 视频";
+    }
+  };
+  picker.click();
+}
+
 function openAgentEditor(agentId, options = {}) {
   $("#connectionPopover").classList.add("hidden");
   const agent = agentById(agentId);
@@ -1176,6 +1546,8 @@ function openAgentEditor(agentId, options = {}) {
   const boundNames = (agent.accountIds || []).map(accountDisplayName);
   const selected = (value) => persona.gender === value ? "selected" : "";
   const rules = (agent.rules || []).map(agentRuleRow).join("");
+  const welcomeFlow = agent.welcomeFlow || { enabled: true, steps: [] };
+  const welcomeSteps = (welcomeFlow.steps || []).map(agentWelcomeStepRow).join("");
   const sharedNotice = agent.accountCount > 1 ? `修改会同步应用到 ${agent.accountCount} 个账号：${boundNames.join("、")}` : boundNames.length ? `当前绑定账号：${boundNames.join("、")}` : "这个智能体目前没有绑定账号";
   $(".modal-card").classList.add("agent-modal-card");
   $("#modalBody").innerHTML = `
@@ -1191,6 +1563,11 @@ function openAgentEditor(agentId, options = {}) {
         <label class="wide">主营业务与事实边界<textarea name="business" required rows="4" placeholder="明确销售什么、公司定位、不能编造的事实…">${escapeHtml(persona.business || "")}</textarea></label>
         <label class="wide">客服性格<input name="personality" required value="${escapeHtml(persona.personality || "耐心、主动、善于追问客户需求")}" placeholder="例如：耐心、主动、简洁、有销售推进意识"></label>
         <label class="wide">从历史会话总结的表达方式<textarea name="summary" rows="4" placeholder="例如：跟随客户语言，先回应情绪，再简洁回答；每次只推进一个问题。">${escapeHtml(agent.summary || "")}</textarea></label>
+        <div class="wide agent-welcome-editor">
+          <div class="welcome-editor-head"><div><strong>首次接待流程</strong><span>新客户纯招呼或 ManosID 询盘触发，严格按 1 → 2 → 3 的顺序逐条发送</span></div><label class="welcome-enabled"><input data-welcome-enabled type="checkbox" ${welcomeFlow.enabled === false ? "" : "checked"}><span>启用</span></label></div>
+          <div data-welcome-list class="welcome-step-list">${welcomeSteps}<div class="welcome-empty ${welcomeSteps ? "hidden" : ""}" data-empty-welcome>暂无步骤；关闭时由智能体按上下文正常回答。</div></div>
+          <div class="welcome-add-actions"><button data-welcome-add="text" type="button">＋ 文字</button><button data-welcome-add="image" type="button">＋ 图片</button><button data-welcome-add="video" type="button">＋ 视频</button><span>最多 12 步，图片与视频单个不超过 35 MB</span></div>
+        </div>
         <div class="wide agent-rule-editor"><div class="style-rules-head"><span>补充规则与可复用知识</span><button data-agent-rule-add type="button">＋ 新增规则</button></div><div data-agent-rule-list class="style-rules">${rules || `<div class="small-copy" data-empty-agent-rules>暂无规则，可按需要新增</div>`}</div></div>
         <div class="modal-actions wide"><button class="ghost-button" type="button" data-agent-cancel>取消</button><button class="primary-button" type="submit">保存智能体</button></div>
       </form>
@@ -1206,6 +1583,29 @@ function openAgentEditor(agentId, options = {}) {
     $$('[data-rule-text]', list).at(-1)?.focus();
   });
   $("[data-agent-rule-list]").addEventListener("click", (event) => event.target.closest("[data-agent-rule-remove]")?.closest("[data-agent-rule]")?.remove());
+  const welcomeList = $("[data-welcome-list]");
+  refreshAgentWelcomeOrder(welcomeList);
+  $('[data-welcome-add="text"]').addEventListener("click", () => {
+    if ($$('[data-welcome-step]', welcomeList).length >= 12) return toast("首次接待流程最多 12 步", "error");
+    welcomeList.insertAdjacentHTML("beforeend", agentWelcomeStepRow({ type: "text" }, $$('[data-welcome-step]', welcomeList).length));
+    refreshAgentWelcomeOrder(welcomeList);
+    $$('[data-welcome-text]', welcomeList).at(-1)?.focus();
+  });
+  ["image", "video"].forEach((type) => {
+    const addButton = $(`[data-welcome-add="${type}"]`);
+    addButton.addEventListener("click", () => {
+      if ($$('[data-welcome-step]', welcomeList).length >= 12) return toast("首次接待流程最多 12 步", "error");
+      addAgentWelcomeMedia(agentId, type, welcomeList, addButton);
+    });
+  });
+  welcomeList.addEventListener("click", (event) => {
+    const row = event.target.closest("[data-welcome-step]");
+    if (!row) return;
+    if (event.target.closest("[data-welcome-remove]")) row.remove();
+    else if (event.target.closest('[data-welcome-move="up"]') && row.previousElementSibling?.matches("[data-welcome-step]")) row.previousElementSibling.before(row);
+    else if (event.target.closest('[data-welcome-move="down"]') && row.nextElementSibling?.matches("[data-welcome-step]")) row.after(row.nextElementSibling);
+    refreshAgentWelcomeOrder(welcomeList);
+  });
   $("#agentEditForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     const button = event.submitter;
@@ -1220,6 +1620,18 @@ function openAgentEditor(agentId, options = {}) {
       progress: data.summary ? 100 : Number(agent.progress || 0),
       progressLabel: data.summary ? "智能体设定已保存" : "可从账号历史记录继续学习",
       persona: { gender: data.gender, business: data.business, tone: data.tone, personality: data.personality },
+      welcomeFlow: {
+        enabled: $("[data-welcome-enabled]", form).checked,
+        steps: $$('[data-welcome-step]', form).map((row) => ({
+          id: row.dataset.stepId,
+          type: row.dataset.stepType,
+          text: $("[data-welcome-text]", row)?.value.trim() || "",
+          caption: $("[data-welcome-caption]", row)?.value.trim() || "",
+          mediaUrl: row.dataset.mediaUrl || "",
+          mimeType: row.dataset.mimeType || "",
+          filename: row.dataset.filename || ""
+        }))
+      },
       rules: $$('[data-agent-rule]', form).map((row) => ({ id: row.dataset.ruleId, source: row.dataset.ruleSource || "manual", enabled: $("[data-rule-enabled]", row).checked, text: $("[data-rule-text]", row).value.trim() })).filter((rule) => rule.text)
     };
     try {
@@ -1421,6 +1833,7 @@ function bindEvents() {
     }
   });
   $("#createAgentButton").addEventListener("click", openCreateAgent);
+  $("#importAgentButton").addEventListener("click", chooseAgentPackage);
   $("#accountStyleBoard").addEventListener("click", async (event) => {
     const button = event.target.closest("[data-agent-action]");
     if (!button) return;
@@ -1429,7 +1842,11 @@ function bindEvents() {
     if (action === "edit") return openAgentEditor(agentId);
     button.disabled = true;
     try {
-      if (action === "clone") {
+      if (action === "export") {
+        const agent = agentById(agentId);
+        if (!agent) throw new Error("智能体不存在，请刷新后重试");
+        await exportAgentPackage(agent);
+      } else if (action === "clone") {
         const result = await api(`/api/agents/${encodeURIComponent(agentId)}/clone`, { method: "POST", body: "{}" });
         await loadStatus();
         toast("智能体副本已创建，可独立编辑或绑定给其他账号");

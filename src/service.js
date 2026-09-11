@@ -1,6 +1,9 @@
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const EventEmitter = require("events");
+const archiver = require("archiver");
+const unzipper = require("unzipper");
 const {
   LocalAI,
   answerFromManualRules,
@@ -11,10 +14,10 @@ const {
 const { SupplierSearch, aggregateProductFacts } = require("./supplier");
 const { contextKeywords } = require("./store");
 const { calculateFinalQuote, QUOTE_CURRENCIES, SHIPPING_OPTIONS_CNY } = require("./pricing");
+const { generateQuotationImage } = require("./quotation-image");
+const { defaultQuotationNotes, normalizeQuotationNotes } = require("./quotation-notes");
 const {
-  MANOS_LEAD_WELCOME,
   MANOS_ALBUM_FOLLOW_UP,
-  NEW_CUSTOMER_WELCOME,
   isSystemConversation,
   isManosLead,
   isGreeting,
@@ -30,6 +33,10 @@ const HUMAN_TRIGGERS = [
 ];
 const TRANSLATION_VERSION = 3;
 const QUOTE_REPLY_LANGUAGES = ["auto", "zh", "en", "fr", "es", "de", "it", "pt", "ar", "ru", "ja", "ko"];
+const AGENT_PACKAGE_FORMAT = "whatsapp-sales-ai-agent";
+const AGENT_PACKAGE_VERSION = 1;
+const AGENT_PACKAGE_MAX_BYTES = 200 * 1024 * 1024;
+const AGENT_MEDIA_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "video/mp4", "video/webm", "video/quicktime", "video/x-m4v"]);
 
 function isPriceQuestion(text) {
   return HUMAN_TRIGGERS[0].pattern.test(String(text || ""));
@@ -209,6 +216,14 @@ function extension(mimeType) {
   })[normalized] || ".bin";
 }
 
+function safeFilename(value, fallback = "agent") {
+  return String(value || fallback).replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").trim().slice(0, 120) || fallback;
+}
+
+function sha256(buffer) {
+  return crypto.createHash("sha256").update(buffer).digest("hex");
+}
+
 function conversationKey(accountId, providerChatId) {
   return `${String(accountId || "primary")}::${String(providerChatId || "")}`;
 }
@@ -296,14 +311,52 @@ function inferCustomerSignals(messages, quotes, contact) {
 function factoryPriceAcknowledgement(message, language = "") {
   const useChinese = language ? language === "zh" : /[\p{Script=Han}]/u.test(String(message?.body || ""));
   return useChinese
-    ? "好的亲爱的，我会询问一下工厂。"
-    : "Okay dear, I’ll check with the factory for you.";
+    ? "请稍等，dear，我询问工厂后就为您制作报价单。"
+    : "Please wait a moment, dear. I’ll check with the factory and prepare a quotation for you.";
+}
+
+const MULTI_PRODUCT_QUOTE_CAPTIONS = Object.freeze({
+  zh: "亲爱的，这是工厂为您所选商品制作的报价单，请您核查。如需调整，请告诉我。",
+  en: "Dear, this is the factory's quotation for the products you selected. Please check it and let me know if anything needs to be adjusted.",
+  fr: "Voici le devis de l’usine pour les produits que vous avez sélectionnés. Merci de le vérifier et de me dire si quelque chose doit être modifié.",
+  es: "Esta es la cotización de la fábrica para los productos que seleccionó. Por favor, revísela y dígame si necesita algún ajuste.",
+  de: "Dies ist das Angebot der Fabrik für die von Ihnen ausgewählten Produkte. Bitte prüfen Sie es und sagen Sie mir, falls etwas angepasst werden soll.",
+  it: "Questo è il preventivo della fabbrica per i prodotti che ha selezionato. La prego di controllarlo e di dirmi se desidera modifiche.",
+  pt: "Esta é a cotação da fábrica para os produtos que você selecionou. Por favor, confira e me avise se precisar de algum ajuste.",
+  ar: "هذا هو عرض سعر المصنع للمنتجات التي اخترتها. يُرجى مراجعته وإخباري إذا كنت ترغب في أي تعديل.",
+  ru: "Это предложение фабрики по выбранным вами товарам. Пожалуйста, проверьте его и сообщите, если нужно что-либо изменить.",
+  ja: "こちらはお選びいただいた商品の工場見積書です。内容をご確認いただき、修正が必要でしたらお知らせください。",
+  ko: "선택하신 상품에 대한 공장 견적서입니다. 확인해 보시고 수정이 필요하면 말씀해 주세요."
+});
+
+function multiProductQuoteCaption(language = "en") {
+  const target = String(language || "en").toLowerCase().split("-")[0];
+  return MULTI_PRODUCT_QUOTE_CAPTIONS[target] || MULTI_PRODUCT_QUOTE_CAPTIONS.en;
 }
 
 function stockOutReply(message) {
   return /[\p{Script=Han}]/u.test(String(message?.body || ""))
     ? "抱歉亲爱的，这款工厂告诉我暂时缺货。"
     : "Sorry dear, the factory told me this item is temporarily out of stock.";
+}
+
+const STOCK_OUT_QUOTE_CAPTIONS = Object.freeze({
+  zh: "抱歉亲爱的，这款商品目前缺货。",
+  en: "Sorry dear, this item is currently out of stock.",
+  fr: "Désolée, ce produit est actuellement en rupture de stock.",
+  es: "Lo siento, este producto está agotado actualmente.",
+  de: "Es tut mir leid, dieser Artikel ist derzeit nicht auf Lager.",
+  it: "Mi dispiace, questo articolo è attualmente esaurito.",
+  pt: "Desculpe, este produto está esgotado no momento.",
+  ar: "عذرًا، هذا المنتج غير متوفر حاليًا.",
+  ru: "Извините, этого товара сейчас нет в наличии.",
+  ja: "申し訳ありません。この商品は現在在庫切れです。",
+  ko: "죄송하지만 이 상품은 현재 품절입니다。"
+});
+
+function stockOutQuoteCaption(language = "en") {
+  const target = String(language || "en").toLowerCase().split("-")[0];
+  return STOCK_OUT_QUOTE_CAPTIONS[target] || STOCK_OUT_QUOTE_CAPTIONS.en;
 }
 
 function factsDescription(facts, language = "en") {
@@ -718,6 +771,159 @@ class SalesService extends EventEmitter {
     return agent;
   }
 
+  async exportAgentPackage(agentId) {
+    const agent = this.store.getAgent(agentId);
+    if (!agent) throw Object.assign(new Error("智能体不存在"), { statusCode: 404 });
+    const assets = [];
+    const welcomeSteps = (agent.welcomeFlow?.steps || []).map((step, index) => {
+      if (step.type === "text") return { ...step };
+      if (!AGENT_MEDIA_MIME_TYPES.has(step.mimeType)) throw Object.assign(new Error(`首次接待第 ${index + 1} 步的媒体类型无法导出`), { statusCode: 400 });
+      if (!/^\/media\//.test(String(step.mediaUrl || ""))) throw Object.assign(new Error(`首次接待第 ${index + 1} 步缺少可导出的媒体文件`), { statusCode: 410 });
+      let storedName;
+      try { storedName = path.basename(decodeURIComponent(String(step.mediaUrl).slice("/media/".length))); }
+      catch (_error) { throw Object.assign(new Error(`首次接待第 ${index + 1} 步的媒体地址无效`), { statusCode: 400 }); }
+      const localPath = path.join(this.mediaDir, storedName);
+      if (!fs.existsSync(localPath)) throw Object.assign(new Error(`首次接待素材已丢失：${step.filename || storedName}`), { statusCode: 410 });
+      const buffer = fs.readFileSync(localPath);
+      if (buffer.length > 35 * 1024 * 1024) throw Object.assign(new Error(`素材 ${step.filename || storedName} 超过 35 MB，无法导出`), { statusCode: 413 });
+      const archiveName = `assets/${String(index + 1).padStart(2, "0")}-${safeFilename(step.filename || storedName, `media-${index + 1}`)}`;
+      assets.push({ archiveName, buffer });
+      return { ...step, mediaUrl: "", assetPath: archiveName, sha256: sha256(buffer), size: buffer.length };
+    });
+    const manifest = {
+      format: AGENT_PACKAGE_FORMAT,
+      version: AGENT_PACKAGE_VERSION,
+      exportedAt: new Date().toISOString(),
+      agent: {
+        name: agent.name,
+        description: agent.description || "",
+        status: agent.status || "pending",
+        summary: agent.summary || "",
+        rules: agent.rules || [],
+        persona: agent.persona || {},
+        sampleCount: Number(agent.sampleCount || 0),
+        progress: Number(agent.progress || 0),
+        progressLabel: agent.progressLabel || "",
+        welcomeFlow: { enabled: agent.welcomeFlow?.enabled !== false, steps: welcomeSteps }
+      }
+    };
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    const chunks = [];
+    const completed = new Promise((resolve, reject) => {
+      archive.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+      archive.on("end", resolve);
+      archive.on("error", reject);
+      archive.on("warning", reject);
+    });
+    archive.append(JSON.stringify(manifest, null, 2), { name: "agent.json" });
+    for (const asset of assets) archive.append(asset.buffer, { name: asset.archiveName });
+    await archive.finalize();
+    await completed;
+    const buffer = Buffer.concat(chunks);
+    if (buffer.length > AGENT_PACKAGE_MAX_BYTES) throw Object.assign(new Error("智能体包超过 200 MB，请减少首次接待媒体后再导出"), { statusCode: 413 });
+    return { buffer, filename: `${safeFilename(agent.name, "agent")}.wa-agent` };
+  }
+
+  async importAgentPackage(packageBuffer) {
+    if (!Buffer.isBuffer(packageBuffer) || !packageBuffer.length) throw Object.assign(new Error("请选择有效的智能体文件"), { statusCode: 400 });
+    if (packageBuffer.length > AGENT_PACKAGE_MAX_BYTES) throw Object.assign(new Error("智能体文件不能超过 200 MB"), { statusCode: 413 });
+    let directory;
+    try { directory = await unzipper.Open.buffer(packageBuffer); }
+    catch (_error) { throw Object.assign(new Error("无法读取智能体文件，请确认文件完整"), { statusCode: 400 }); }
+    const files = directory.files.filter((entry) => entry.type === "File");
+    const uncompressedBytes = files.reduce((sum, entry) => sum + Number(entry.vars?.uncompressedSize || 0), 0);
+    if (uncompressedBytes > AGENT_PACKAGE_MAX_BYTES) throw Object.assign(new Error("智能体解压后超过 200 MB"), { statusCode: 413 });
+    const manifestEntry = files.find((entry) => entry.path === "agent.json");
+    if (!manifestEntry || Number(manifestEntry.vars?.uncompressedSize || 0) > 2 * 1024 * 1024) throw Object.assign(new Error("智能体文件缺少有效的 agent.json"), { statusCode: 400 });
+    let manifest;
+    try { manifest = JSON.parse((await manifestEntry.buffer()).toString("utf8")); }
+    catch (_error) { throw Object.assign(new Error("智能体配置格式损坏"), { statusCode: 400 }); }
+    if (manifest?.format !== AGENT_PACKAGE_FORMAT || Number(manifest?.version) !== AGENT_PACKAGE_VERSION || !manifest.agent) {
+      throw Object.assign(new Error("不支持该智能体文件版本"), { statusCode: 400 });
+    }
+    const source = manifest.agent;
+    const importedSteps = [];
+    let actualAssetBytes = 0;
+    for (const [index, rawStep] of (Array.isArray(source.welcomeFlow?.steps) ? source.welcomeFlow.steps : []).slice(0, 12).entries()) {
+      const type = ["text", "image", "video"].includes(rawStep?.type) ? rawStep.type : "";
+      if (!type) throw Object.assign(new Error(`首次接待第 ${index + 1} 步类型无效`), { statusCode: 400 });
+      if (type === "text") {
+        importedSteps.push({ id: rawStep.id, type, text: rawStep.text });
+        continue;
+      }
+      const assetPath = String(rawStep.assetPath || "");
+      const assetName = assetPath.startsWith("assets/") ? assetPath.slice("assets/".length) : "";
+      if (!assetName || assetName.includes("/") || assetName.includes("\\") || assetName.includes("..")) throw Object.assign(new Error(`首次接待第 ${index + 1} 步素材路径无效`), { statusCode: 400 });
+      const mimeType = String(rawStep.mimeType || "").toLowerCase().split(";")[0].trim();
+      if (!AGENT_MEDIA_MIME_TYPES.has(mimeType) || !mimeType.startsWith(`${type}/`)) throw Object.assign(new Error(`首次接待第 ${index + 1} 步媒体类型无效`), { statusCode: 400 });
+      const assetEntry = files.find((entry) => entry.path === assetPath);
+      if (!assetEntry) throw Object.assign(new Error(`智能体包缺少素材：${rawStep.filename || assetPath}`), { statusCode: 400 });
+      const buffer = await assetEntry.buffer();
+      actualAssetBytes += buffer.length;
+      if (!buffer.length || buffer.length > 35 * 1024 * 1024 || actualAssetBytes > AGENT_PACKAGE_MAX_BYTES) throw Object.assign(new Error(`素材 ${rawStep.filename || assetPath} 大小无效`), { statusCode: 413 });
+      if (rawStep.sha256 && sha256(buffer) !== rawStep.sha256) throw Object.assign(new Error(`素材校验失败：${rawStep.filename || assetPath}`), { statusCode: 400 });
+      importedSteps.push({ id: rawStep.id, type, caption: rawStep.caption, mimeType, filename: rawStep.filename, buffer });
+    }
+    const base = {
+      name: String(source.name || "导入智能体").trim().slice(0, 80) || "导入智能体",
+      description: source.description,
+      status: ["ready", "pending", "needs_input", "error"].includes(source.status) ? source.status : "needs_input",
+      summary: source.summary,
+      rules: source.rules,
+      persona: source.persona,
+      sampleCount: source.sampleCount,
+      progress: source.progress,
+      progressLabel: source.progressLabel,
+      welcomeFlow: { enabled: source.welcomeFlow?.enabled !== false, steps: importedSteps.filter((step) => step.type === "text") }
+    };
+    let created;
+    const createdMediaPaths = [];
+    try {
+      created = this.createAgent(base);
+      const finalSteps = importedSteps.map((step) => {
+        if (step.type === "text") return step;
+        const uploaded = this.uploadAgentWelcomeMedia(created.id, {
+          data: step.buffer.toString("base64"),
+          mimeType: step.mimeType,
+          filename: step.filename
+        });
+        createdMediaPaths.push(path.join(this.mediaDir, path.basename(decodeURIComponent(uploaded.mediaUrl.slice("/media/".length)))));
+        return { id: step.id, ...uploaded, caption: step.caption };
+      });
+      return this.updateAgent(created.id, { ...base, welcomeFlow: { enabled: source.welcomeFlow?.enabled !== false, steps: finalSteps } });
+    } catch (error) {
+      for (const mediaPath of createdMediaPaths) {
+        try { fs.unlinkSync(mediaPath); } catch (_) {}
+      }
+      if (created) {
+        try { this.store.deleteAgent(created.id); } catch (_) {}
+      }
+      throw error;
+    }
+  }
+
+  uploadAgentWelcomeMedia(agentId, media = {}) {
+    const agent = this.store.getAgent(agentId);
+    if (!agent) throw Object.assign(new Error("智能体不存在"), { statusCode: 404 });
+    const mimeType = String(media.mimeType || "").toLowerCase().split(";")[0].trim();
+    const type = mimeType.startsWith("image/") ? "image" : mimeType.startsWith("video/") ? "video" : "";
+    if (!type || !AGENT_MEDIA_MIME_TYPES.has(mimeType)) throw Object.assign(new Error("仅支持 JPG、PNG、WEBP、GIF、MP4、WEBM、MOV 或 M4V"), { statusCode: 400 });
+    const data = String(media.data || "").replace(/^data:[^;]+;base64,/i, "").replace(/\s+/g, "");
+    const buffer = Buffer.from(data, "base64");
+    if (!data || !buffer.length) throw Object.assign(new Error("素材内容无效"), { statusCode: 400 });
+    if (buffer.length > 35 * 1024 * 1024) throw Object.assign(new Error("单个招呼素材不能超过 35 MB"), { statusCode: 413 });
+    const safeAgentId = String(agent.id).replace(/[^a-zA-Z0-9_-]/g, "_");
+    const filename = `welcome-${safeAgentId}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}${extension(mimeType)}`;
+    fs.writeFileSync(path.join(this.mediaDir, filename), buffer);
+    return {
+      type,
+      mediaUrl: `/media/${encodeURIComponent(filename)}`,
+      mimeType,
+      filename: String(media.filename || filename).replace(/[\\/:*?"<>|]/g, "_").slice(0, 180),
+      size: buffer.length
+    };
+  }
+
   cloneAgent(agentId, name = "") {
     const source = this.store.getAgent(agentId);
     if (!source) throw Object.assign(new Error("智能体不存在"), { statusCode: 404 });
@@ -1013,9 +1219,10 @@ class SalesService extends EventEmitter {
   }
 
   updateAutomation(message, state, patch = {}) {
+    const current = this.store.getMessage(message.chatId, message.id) || message;
     const updated = this.store.updateMessage(message.id, {
       metadata: {
-        ...(message.metadata || {}),
+        ...(current.metadata || {}),
         automationState: state,
         automationAt: Date.now(),
         ...patch
@@ -1091,23 +1298,15 @@ class SalesService extends EventEmitter {
       return { state: "handoff", reason: criticalTrigger.reason };
     }
     if (isManosLead(message)) {
-      await this.sendText(message.chatId, MANOS_LEAD_WELCOME, {
-        source: "lead-welcome",
-        replyToId: message.id,
-        metadata: { campaign: "ManosID", fixedWelcome: true }
-      });
-      return { state: "replied", source: "lead-welcome", reason: "ManosID 正常广告询盘" };
+      const welcome = await this.sendWelcomeFlow(message, "lead-welcome", { campaign: "ManosID" });
+      if (welcome) return { state: "replied", source: "lead-welcome", reason: `ManosID 正常广告询盘，已按顺序发送 ${welcome.count} 个接待步骤` };
     }
     const context = this.store.getContext(message.chatId, message.body)
       .filter((item) => item.id === message.id || item.createdAt <= message.createdAt);
     const isFirstConversationMessage = context.every((item) => item.id === message.id);
     if (isFirstConversationMessage && isGreeting(message)) {
-      await this.sendText(message.chatId, NEW_CUSTOMER_WELCOME, {
-        source: "new-customer-welcome",
-        replyToId: message.id,
-        metadata: { deterministic: true, firstContact: true }
-      });
-      return { state: "replied", source: "new-customer-welcome", reason: "新客户首次招呼已即时回复" };
+      const welcome = await this.sendWelcomeFlow(message, "new-customer-welcome", { deterministic: true, firstContact: true });
+      if (welcome) return { state: "replied", source: "new-customer-welcome", reason: `新客户首次招呼已按顺序发送 ${welcome.count} 个接待步骤` };
     }
     if (isIdentityQuestion(message.body)) {
       await this.sendText(message.chatId, customerServiceIdentityReply(message.body), {
@@ -1276,10 +1475,61 @@ class SalesService extends EventEmitter {
     if (!message) throw Object.assign(new Error("客户消息不存在"), { statusCode: 404 });
     if (message.direction !== "inbound") throw Object.assign(new Error("只能对客户发来的消息使用 AI 回复"), { statusCode: 400 });
     if (isSystemConversation({ ...this.store.getContact(chatId), ...message })) throw Object.assign(new Error("已过滤 WhatsApp 官方或系统消息"), { statusCode: 400 });
-    if (this.store.hasLaterOutbound(chatId, message.createdAt, message.id)) throw Object.assign(new Error("该消息之后已经发送过回复，请勿重复发送"), { statusCode: 409 });
+    const resumableWelcome = message.metadata?.automationState === "failed" && Array.isArray(message.metadata?.welcomeCompletedStepIds);
+    if (!resumableWelcome && this.store.hasLaterOutbound(chatId, message.createdAt, message.id)) throw Object.assign(new Error("该消息之后已经发送过回复，请勿重复发送"), { statusCode: 409 });
     if (message.metadata?.automationState === "processing") throw Object.assign(new Error("这条消息正在生成回复"), { statusCode: 409 });
     if (["replied", "quote_pending"].includes(message.metadata?.automationState)) throw Object.assign(new Error("这条消息已经处理，请勿重复发送"), { statusCode: 409 });
     return this.enqueue(chatId, () => this.processAndRecord(message, null, "历史图片无法自动重新下载", { manualTrigger: true }));
+  }
+
+  quoteBatchRows(quote) {
+    if (!quote) return [];
+    const batchId = String(quote.quotationBatchId || `quote-${quote.id}`);
+    return this.store.listQuotes("all", quote.chatId)
+      .filter((item) => String(item.quotationBatchId || `quote-${item.id}`) === batchId)
+      .filter((item) => ["pending", "approved"].includes(item.status));
+  }
+
+  async acknowledgeQuotePreparation(quote, message, acknowledgement) {
+    const batch = this.quoteBatchRows(quote);
+    const acknowledged = batch.find((item) => item.acknowledgementSentMessageId);
+    if (acknowledged) {
+      return this.store.updateQuote(quote.id, {
+        acknowledgement: acknowledgement || acknowledged.acknowledgement,
+        acknowledgementSentMessageId: acknowledged.acknowledgementSentMessageId,
+        acknowledgementDeferred: false,
+        acknowledgementDeferredReason: ""
+      });
+    }
+    if (this.store.hasLaterInbound(message.chatId, message.createdAt, message.id)) {
+      return this.store.updateQuote(quote.id, {
+        acknowledgementDeferred: true,
+        acknowledgementDeferredReason: "客户之后已有更新消息，为避免错序，将由同批最后一件商品统一发送制作报价单提示"
+      });
+    }
+    try {
+      const quoteIds = batch.map((item) => item.id);
+      const sent = await this.sendText(message.chatId, acknowledgement, {
+        source: "quote-preparation",
+        replyToId: message.id,
+        metadata: { quoteId: quote.id, quoteIds, supplier: quote.supplier, searchStatus: quote.searchStatus }
+      });
+      let current = quote;
+      for (const item of batch) {
+        const updated = this.store.updateQuote(item.id, {
+          acknowledgement: acknowledgement || item.acknowledgement,
+          acknowledgementSentMessageId: sent.id,
+          acknowledgementDeferred: false,
+          acknowledgementDeferredReason: ""
+        });
+        if (item.id === quote.id) current = updated;
+      }
+      return current;
+    } catch (sendError) {
+      return this.store.updateQuote(quote.id, {
+        error: [quote.error, `告知客户失败：${sendError.message}`].filter(Boolean).join("；")
+      });
+    }
   }
 
   async processImage(message, media, mediaError = "") {
@@ -1320,12 +1570,16 @@ class SalesService extends EventEmitter {
     const productFacts = aggregateProductFacts(pricedProducts);
     const customerLanguage = this.store.inferCustomerLanguage(message.chatId, message.id);
     const templateLanguage = customerLanguage === "zh" ? "zh" : "en";
-    const template = estimate.suggestedPrice > 0
+    const draftTemplate = estimate.suggestedPrice > 0
       ? pricedQuoteDraft(message, estimate, productFacts, templateLanguage)
       : factoryPriceAcknowledgement(message, templateLanguage);
-    const localized = await this.localizeQuoteDraft(template, templateLanguage, customerLanguage);
-    const acknowledgement = estimate.suggestedPrice > 0 ? "" : localized.text;
-    const draftReply = estimate.suggestedPrice > 0 ? localized.text : acknowledgement;
+    const acknowledgementTemplate = factoryPriceAcknowledgement(message, templateLanguage);
+    const [localized, localizedAcknowledgement] = await Promise.all([
+      this.localizeQuoteDraft(draftTemplate, templateLanguage, customerLanguage),
+      this.localizeQuoteDraft(acknowledgementTemplate, templateLanguage, customerLanguage)
+    ]);
+    const acknowledgement = localizedAcknowledgement.text;
+    const draftReply = localized.text;
     let quote = this.store.createQuote({
       chatId: message.chatId,
       inboundMessageId: message.id,
@@ -1335,6 +1589,7 @@ class SalesService extends EventEmitter {
       searchStatus,
       products: pricedProducts,
       productFacts,
+      quotationNotes: defaultQuotationNotes(productFacts),
       basePriceCny: estimate.suggestedPrice,
       ...estimate,
       draftReply,
@@ -1345,25 +1600,7 @@ class SalesService extends EventEmitter {
       error
     });
     if (quote.reusedExisting) return quote;
-    if (quote.quoteType === "factory_inquiry") {
-      if (this.store.hasLaterInbound(message.chatId, message.createdAt, message.id)) {
-        quote = this.store.updateQuote(quote.id, {
-          acknowledgementDeferred: true,
-          acknowledgementDeferredReason: "客户之后已有更新消息，为避免错序未自动发送询厂话术"
-        });
-      } else {
-        try {
-          const sent = await this.sendText(message.chatId, acknowledgement, {
-            source: "factory-inquiry",
-            replyToId: message.id,
-            metadata: { quoteId: quote.id, supplier: quote.supplier, searchStatus }
-          });
-          quote = this.store.updateQuote(quote.id, { acknowledgementSentMessageId: sent.id, acknowledgementDeferred: false, acknowledgementDeferredReason: "" });
-        } catch (sendError) {
-          quote = this.store.updateQuote(quote.id, { error: [error, `告知客户失败：${sendError.message}`].filter(Boolean).join("；") });
-        }
-      }
-    }
+    quote = await this.acknowledgeQuotePreparation(quote, message, acknowledgement);
     this.publish("quote", { chatId: message.chatId, quote });
     return quote;
   }
@@ -1388,11 +1625,15 @@ class SalesService extends EventEmitter {
       const customerLanguage = quote.customerLanguage || this.store.inferCustomerLanguage(message.chatId, message.id);
       const targetLanguage = quote.replyLanguage && quote.replyLanguage !== "auto" ? quote.replyLanguage : customerLanguage;
       const templateLanguage = targetLanguage === "zh" ? "zh" : "en";
-      const template = priced
+      const draftTemplate = priced
         ? pricedQuoteDraft(message, estimate, productFacts, templateLanguage)
         : factoryPriceAcknowledgement(message, templateLanguage);
-      const localized = await this.localizeQuoteDraft(template, templateLanguage, targetLanguage);
-      const acknowledgement = priced ? "" : localized.text;
+      const acknowledgementTemplate = factoryPriceAcknowledgement(message, templateLanguage);
+      const [localized, localizedAcknowledgement] = await Promise.all([
+        this.localizeQuoteDraft(draftTemplate, templateLanguage, targetLanguage),
+        this.localizeQuoteDraft(acknowledgementTemplate, templateLanguage, targetLanguage)
+      ]);
+      const acknowledgement = localizedAcknowledgement.text;
       quote = this.store.updateQuote(quote.id, {
         imageMediaUrl: message.mediaUrl,
         quoteType: priced ? "priced" : "factory_inquiry",
@@ -1400,6 +1641,7 @@ class SalesService extends EventEmitter {
         searchStatus: priced ? "priced" : (products.length ? "no_price" : "no_match"),
         products: pricedProducts,
         productFacts,
+        quotationNotes: defaultQuotationNotes(productFacts),
         basePriceCny: estimate.suggestedPrice,
         ...estimate,
         draftReply: localized.text,
@@ -1408,21 +1650,7 @@ class SalesService extends EventEmitter {
         draftLanguage: localized.language,
         error: ""
       });
-      if (!priced && !quote.acknowledgementSentMessageId) {
-        if (this.store.hasLaterInbound(message.chatId, message.createdAt, message.id)) {
-          quote = this.store.updateQuote(quote.id, {
-            acknowledgementDeferred: true,
-            acknowledgementDeferredReason: "客户之后已有更新消息，为避免错序未自动发送询厂话术"
-          });
-        } else {
-          const sent = await this.sendText(message.chatId, acknowledgement, {
-            source: "factory-inquiry",
-            replyToId: message.id,
-            metadata: { quoteId: quote.id, supplier: quote.supplier, searchStatus: quote.searchStatus }
-          });
-          quote = this.store.updateQuote(quote.id, { acknowledgementSentMessageId: sent.id, acknowledgementDeferred: false, acknowledgementDeferredReason: "" });
-        }
-      }
+      if (!quote.acknowledgementSentMessageId) quote = await this.acknowledgeQuotePreparation(quote, message, acknowledgement);
       this.publish("quote", { chatId: quote.chatId, quote });
       return quote;
     } catch (error) {
@@ -1597,6 +1825,95 @@ class SalesService extends EventEmitter {
     return row;
   }
 
+  async sendWelcomeFlow(message, source, metadata = {}) {
+    const flow = this.store.getAccountStyle(message.accountId)?.welcomeFlow;
+    const steps = Array.isArray(flow?.steps) ? flow.steps : [];
+    if (flow?.enabled === false || !steps.length) return null;
+    const latestInbound = this.store.getMessage(message.chatId, message.id) || message;
+    const completedIds = new Set(Array.isArray(latestInbound.metadata?.welcomeCompletedStepIds)
+      ? latestInbound.metadata.welcomeCompletedStepIds.map(String)
+      : []);
+    let sentCount = 0;
+    for (let index = 0; index < steps.length; index += 1) {
+      const step = steps[index];
+      const stepId = String(step.id || `welcome-${index}`);
+      if (completedIds.has(stepId)) continue;
+      const stepMetadata = { ...metadata, welcomeFlow: true, welcomeStepId: stepId, welcomeStep: index + 1, welcomeStepCount: steps.length };
+      try {
+        if (step.type === "text") {
+          await this.sendText(message.chatId, step.text, { source, replyToId: message.id, metadata: stepMetadata });
+        } else {
+          await this.sendWelcomeMedia(message.chatId, step, { source, replyToId: message.id, metadata: stepMetadata });
+        }
+      } catch (error) {
+        const reason = `首次接待第 ${index + 1} 步发送失败：${error.message}`;
+        this.store.requestHuman(message.chatId, reason, message.id);
+        this.publish("handoff", { chatId: message.chatId, accountId: message.accountId, reason });
+        throw error;
+      }
+      completedIds.add(stepId);
+      sentCount += 1;
+      this.updateAutomation(this.store.getMessage(message.chatId, message.id) || message, "processing", {
+        automationReason: `首次接待流程 ${completedIds.size}/${steps.length}`,
+        welcomeCompletedStepIds: [...completedIds],
+        welcomeStepCount: steps.length
+      });
+    }
+    return { count: sentCount, total: steps.length };
+  }
+
+  async sendWelcomeMedia(chatId, step, options = {}) {
+    const contact = this.store.getContact(chatId);
+    if (!contact) throw Object.assign(new Error("会话不存在"), { statusCode: 404 });
+    const mimeType = String(step.mimeType || "").toLowerCase().split(";")[0].trim();
+    const type = mimeType.startsWith("image/") ? "image" : mimeType.startsWith("video/") ? "video" : "";
+    const allowed = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "video/mp4", "video/webm", "video/quicktime", "video/x-m4v"]);
+    if (!type || type !== step.type || !allowed.has(mimeType)) throw Object.assign(new Error("首次接待媒体类型无效"), { statusCode: 400 });
+    if (!/^\/media\//.test(String(step.mediaUrl || ""))) throw Object.assign(new Error("首次接待素材地址无效"), { statusCode: 400 });
+    const storedName = path.basename(decodeURIComponent(String(step.mediaUrl).slice("/media/".length)));
+    const localMediaPath = path.join(this.mediaDir, storedName);
+    if (!fs.existsSync(localMediaPath)) throw Object.assign(new Error(`首次接待素材已丢失：${step.filename || storedName}`), { statusCode: 410 });
+    const data = fs.readFileSync(localMediaPath).toString("base64");
+    const caption = enforceCustomerServiceIdentity(String(step.caption || "").trim(), this.store.getMessage(chatId, options.replyToId)?.body);
+    const filename = String(step.filename || storedName).replace(/[\\/:*?"<>|]/g, "_").slice(0, 180);
+    const sent = await this.session.sendMedia(contact.accountId, contact.providerChatId, { data, mimeType, filename, caption });
+    const repliedMessage = options.replyToId ? this.store.getMessage(chatId, options.replyToId) : null;
+    const latestMessage = this.store.getLatestMessage(chatId);
+    const createdAt = Math.max(Number(sent.createdAt) || Date.now(), Date.now(), repliedMessage ? Number(repliedMessage.createdAt) + 1 : 0, latestMessage ? Number(latestMessage.createdAt) + 1 : 0);
+    const body = caption || (type === "video" ? "[发送视频]" : "[发送图片]");
+    const sourceMetadata = { source: options.source || "welcome-flow", ...(options.metadata || {}), attachment: true, filename, provisional: Boolean(sent.provisional) };
+    const existing = sent.id ? this.store.getMessage(chatId, sent.id) : null;
+    const fields = { localMediaPath, mediaUrl: step.mediaUrl, mimeType };
+    const row = existing
+      ? this.store.updateMessage(existing.id, {
+          ...fields,
+          type,
+          body,
+          direction: "outbound",
+          status: existing.status || "sent",
+          replyToId: options.replyToId || existing.replyToId || "",
+          createdAt,
+          metadata: { ...(existing.metadata || {}), ...sourceMetadata, reconciled: true }
+        }, { chatId })
+      : this.store.addMessage({
+          id: sent.id || `out-welcome-media-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          chatId,
+          accountId: contact.accountId,
+          accountName: contact.accountName,
+          providerChatId: contact.providerChatId,
+          direction: "outbound",
+          type,
+          body,
+          status: "sent",
+          replyToId: options.replyToId || "",
+          metadata: sourceMetadata,
+          createdAt,
+          ...fields
+        }).message;
+    this.publish("message", { chatId, accountId: contact.accountId, message: row });
+    return row;
+  }
+
   async sendManualReply(chatId, body) {
     const contact = this.store.getContact(chatId);
     if (!contact) throw Object.assign(new Error("会话不存在"), { statusCode: 404 });
@@ -1743,7 +2060,9 @@ class SalesService extends EventEmitter {
     const quote = this.store.getQuote(id);
     if (!quote) throw Object.assign(new Error("报价不存在"), { statusCode: 404 });
     if (quote.status === "sent") throw Object.assign(new Error("已发送报价不能编辑"), { statusCode: 409 });
-    let price = patch.suggestedPrice === undefined ? quote.suggestedPrice : Number(patch.suggestedPrice);
+    const hasManualPrice = patch.suggestedPrice !== undefined;
+    const outOfStock = patch.outOfStock !== undefined ? Boolean(patch.outOfStock) : Boolean(quote.outOfStock);
+    let price = hasManualPrice ? Math.round(Number(patch.suggestedPrice)) : quote.suggestedPrice;
     if (!Number.isFinite(price) || price < 0) throw Object.assign(new Error("报价金额无效"), { statusCode: 400 });
     const replyLanguage = String(patch.replyLanguage ?? quote.replyLanguage ?? "auto").toLowerCase().split("-")[0];
     if (!QUOTE_REPLY_LANGUAGES.includes(replyLanguage)) throw Object.assign(new Error("不支持该报价回复语言"), { statusCode: 400 });
@@ -1754,9 +2073,9 @@ class SalesService extends EventEmitter {
       const shippingCny = Number(patch.shippingCny ?? quote.shippingCny ?? 90);
       const profitRate = Number(patch.profitRate ?? quote.profitRate ?? 0.75);
       const exchangeRate = Number(patch.exchangeRate ?? quote.exchangeRate);
-      if (!QUOTE_CURRENCIES.includes(currency)) throw Object.assign(new Error("报价币种只能选择 EUR、USD 或 GBP"), { statusCode: 400 });
+      if (!QUOTE_CURRENCIES.includes(currency)) throw Object.assign(new Error("报价币种只能选择 GBP、EUR、USD 或 AUD"), { statusCode: 400 });
       if (!SHIPPING_OPTIONS_CNY.includes(shippingCny)) throw Object.assign(new Error("运费只能选择 CNY 90、150、180 或 300"), { statusCode: 400 });
-      if (!(profitRate >= 0.7 && profitRate <= 0.8)) throw Object.assign(new Error("利润率必须在 70% 到 80% 之间"), { statusCode: 400 });
+      if (!Number.isFinite(profitRate) || profitRate < 0) throw Object.assign(new Error("利润率必须是大于或等于 0 的数字"), { statusCode: 400 });
       if (!(exchangeRate > 0)) throw Object.assign(new Error("当前币种汇率无效，请刷新报价页面"), { statusCode: 400 });
       formula = calculateFinalQuote({
         basePriceCny: Number(patch.basePriceCny ?? quote.basePriceCny ?? 0),
@@ -1766,16 +2085,31 @@ class SalesService extends EventEmitter {
         rates: { [currency]: exchangeRate }
       });
       formula.rateDate = String(patch.rateDate || quote.rateDate || "");
-      price = formula.suggestedPrice;
+      price = hasManualPrice ? Math.round(Number(patch.suggestedPrice)) : formula.suggestedPrice;
+    }
+    let manualPriceOverride = Boolean(quote.manualPriceOverride);
+    if (hasFormula) manualPriceOverride = hasManualPrice && price !== formula.suggestedPrice;
+    else if (hasManualPrice) manualPriceOverride = true;
+    if (outOfStock) {
+      price = 0;
+      manualPriceOverride = false;
     }
     const updated = this.store.updateQuote(id, {
-      suggestedPrice: price,
       ...(patch.currency !== undefined ? { currency: String(patch.currency) } : {}),
       ...formula,
+      suggestedPrice: price,
+      manualPriceOverride,
+      outOfStock,
+      stockPreviousDraftReply: outOfStock && !quote.outOfStock
+        ? quote.draftReply
+        : !outOfStock && quote.outOfStock
+          ? ""
+          : String(quote.stockPreviousDraftReply || ""),
       ...(patch.draftReply !== undefined ? { draftReply: String(patch.draftReply) } : {}),
       replyLanguage,
       ...(patch.draftLanguage !== undefined ? { draftLanguage: String(patch.draftLanguage) } : {}),
-      ...(patch.reviewerNote !== undefined ? { reviewerNote: String(patch.reviewerNote) } : {})
+      ...(patch.reviewerNote !== undefined ? { reviewerNote: String(patch.reviewerNote) } : {}),
+      ...(patch.quotationNotes !== undefined ? { quotationNotes: normalizeQuotationNotes(patch.quotationNotes, quote.productFacts) } : {})
     });
     this.publish("quote", { chatId: updated.chatId, quote: updated });
     return updated;
@@ -1817,36 +2151,236 @@ class SalesService extends EventEmitter {
     return removed;
   }
 
+  quotationGroupQuotes(anchor, requestedQuoteIds = []) {
+    if (!anchor) return [];
+    const requestedIds = [...new Set((Array.isArray(requestedQuoteIds) ? requestedQuoteIds : [])
+      .map(Number)
+      .filter((id) => Number.isInteger(id) && id > 0))];
+    if (!anchor.quotationBatchId) {
+      if (requestedIds.length > 1 || (requestedIds.length === 1 && requestedIds[0] !== anchor.id)) {
+        throw Object.assign(new Error("只能合并同一客户同一批次的报价"), { statusCode: 400 });
+      }
+      return [anchor];
+    }
+    const groupIds = Array.isArray(anchor.quotationGroupQuoteIds) ? anchor.quotationGroupQuoteIds.map(Number) : [];
+    const isOpen = ["pending", "approved"].includes(anchor.status);
+    let rows = this.store.listQuotes("all", anchor.chatId)
+      .filter((quote) => isOpen ? quote.quotationBatchId === anchor.quotationBatchId : groupIds.includes(quote.id))
+      .filter((quote) => ["pending", "approved"].includes(anchor.status) ? ["pending", "approved"].includes(quote.status) : quote.status === anchor.status)
+      .filter((quote) => quote.outOfStock || Number(quote.basePriceCny || quote.suggestedPrice) > 0)
+      .sort((a, b) => Number(a.createdAt) - Number(b.createdAt) || Number(a.id) - Number(b.id));
+    if (requestedIds.length) {
+      if (!requestedIds.includes(anchor.id)) throw Object.assign(new Error("当前报价未勾选，请从已勾选的商品发起预览或审核"), { statusCode: 400 });
+      const requestedRows = rows.filter((quote) => requestedIds.includes(quote.id));
+      if (requestedRows.length !== requestedIds.length) {
+        throw Object.assign(new Error("选中的商品必须属于同一客户、同一报价批次且仍在待审核"), { statusCode: 400 });
+      }
+      rows = requestedRows;
+    }
+    return rows.some((quote) => quote.id === anchor.id) ? rows : [anchor];
+  }
+
+  syncQuotationGroupPricing(anchor, requestedQuoteIds = []) {
+    const group = this.quotationGroupQuotes(anchor, requestedQuoteIds);
+    if (group.length <= 1 || !(Number(anchor.exchangeRate) > 0)) return group;
+    const shared = {
+      shippingCny: anchor.shippingCny,
+      profitRate: anchor.profitRate,
+      currency: anchor.currency,
+      exchangeRate: anchor.exchangeRate,
+      rateDate: anchor.rateDate,
+      replyLanguage: anchor.replyLanguage
+    };
+    for (const item of group) {
+      if (item.id === anchor.id) continue;
+      this.updateQuote(item.id, {
+        ...shared,
+        basePriceCny: item.basePriceCny,
+        ...(item.manualPriceOverride ? { suggestedPrice: item.suggestedPrice } : {})
+      });
+    }
+    return this.quotationGroupQuotes(this.store.getQuote(anchor.id), group.map((item) => item.id));
+  }
+
+  async prepareQuoteDocument(id, patch = null, options = {}) {
+    const quoteId = Number(id);
+    let quote = this.store.getQuote(quoteId);
+    if (!quote) throw Object.assign(new Error("报价不存在"), { statusCode: 404 });
+    if (patch && ["pending", "approved"].includes(quote.status)) quote = this.updateQuote(quoteId, patch);
+    const contact = this.store.getContact(quote.chatId);
+    if (!contact) throw Object.assign(new Error("报价关联的客户会话不存在"), { statusCode: 404 });
+    const requestedQuoteIds = Array.isArray(options.quoteIds) ? options.quoteIds : [];
+    const group = patch ? this.syncQuotationGroupPricing(quote, requestedQuoteIds) : this.quotationGroupQuotes(quote, requestedQuoteIds);
+    if (group.some((item) => !item.outOfStock && !(Number(item.suggestedPrice) > 0))) {
+      throw Object.assign(new Error("有货商品的报价金额必须大于 0 才能生成报价单"), { statusCode: 400 });
+    }
+    const groupQuoteIds = group.map((item) => item.id);
+    const quotationItems = group.map((item) => {
+      const sourceMessage = this.store.getMessage(item.chatId, item.inboundMessageId);
+      return { ...item, sourceMediaPath: sourceMessage?.localMediaPath || "", quantity: 1 };
+    });
+    const document = await generateQuotationImage({
+      quote: { ...quote, quotationItems },
+      contact,
+      mediaDir: this.mediaDir,
+      force: options.force === true
+    });
+    const generatedAt = Date.now();
+    for (const item of group) {
+      const updated = this.store.updateQuote(item.id, {
+        quotationMediaUrl: document.mediaUrl,
+        quotationFilename: document.filename,
+        quotationGeneratedAt: generatedAt,
+        quotationItemCount: document.itemCount,
+        quotationGroupQuoteIds: groupQuoteIds
+      });
+      this.publish("quote", { chatId: updated.chatId, quote: updated });
+    }
+    quote = this.store.getQuote(quoteId) || quote;
+    return {
+      quote,
+      quotes: group.map((item) => this.store.getQuote(item.id)),
+      document: {
+        mediaUrl: document.mediaUrl,
+        filename: document.filename,
+        mimeType: document.mimeType,
+        width: document.width,
+        height: document.height,
+        itemCount: document.itemCount,
+        total: document.total,
+        currency: document.currency,
+        quoteIds: groupQuoteIds
+      },
+      buffer: document.buffer
+    };
+  }
+
+  async sendQuoteDocument(quote, document) {
+    const contact = this.store.getContact(quote.chatId);
+    if (!contact) throw Object.assign(new Error("会话不存在"), { statusCode: 404 });
+    const repliedMessage = this.store.getMessage(quote.chatId, quote.inboundMessageId);
+    const replyLanguage = String(quote.replyLanguage || "auto").toLowerCase().split("-")[0];
+    const targetLanguage = replyLanguage === "auto" ? String(quote.customerLanguage || "en").toLowerCase().split("-")[0] : replyLanguage;
+    const draft = Number(document.itemCount || 1) > 1
+      ? multiProductQuoteCaption(targetLanguage)
+      : quote.outOfStock
+        ? stockOutQuoteCaption(targetLanguage)
+      : String(quote.draftReply || "").trim();
+    const caption = enforceCustomerServiceIdentity(draft, repliedMessage?.body);
+    const data = document.buffer.toString("base64");
+    const sent = await this.session.sendMedia(contact.accountId, contact.providerChatId, {
+      data,
+      mimeType: "image/png",
+      filename: document.filename,
+      caption
+    });
+    const latestMessage = this.store.getLatestMessage(quote.chatId);
+    const createdAt = Math.max(
+      Number(sent.createdAt) || Date.now(),
+      Date.now(),
+      repliedMessage ? Number(repliedMessage.createdAt) + 1 : 0,
+      latestMessage ? Number(latestMessage.createdAt) + 1 : 0
+    );
+    const metadata = {
+      source: "quote-review",
+      quoteId: quote.id,
+      quoteIds: Array.isArray(document.quoteIds) ? document.quoteIds : [quote.id],
+      quotationItemCount: Number(document.itemCount || 1),
+      approvedPrice: quote.suggestedPrice,
+      approvedTotal: Number(document.total || quote.suggestedPrice),
+      currency: quote.currency,
+      quotationDocument: true,
+      filename: document.filename,
+      provisional: Boolean(sent.provisional)
+    };
+    const cachedFields = this.persistMedia(
+      { id: sent.id || `quotation-${quote.id}-${Date.now()}`, type: "image", mimeType: "image/png" },
+      { data, mimeType: "image/png" }
+    );
+    const existing = sent.id ? this.store.getMessage(quote.chatId, sent.id) : null;
+    const row = existing
+      ? this.store.updateMessage(existing.id, {
+          ...cachedFields,
+          type: "image",
+          mimeType: "image/png",
+          body: caption || "[报价单]",
+          direction: "outbound",
+          status: existing.status || "sent",
+          replyToId: quote.inboundMessageId || existing.replyToId || "",
+          createdAt,
+          metadata: { ...(existing.metadata || {}), ...metadata, reconciled: true }
+        }, { chatId: quote.chatId })
+      : this.store.addMessage({
+          id: sent.id || `quotation-${quote.id}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+          chatId: quote.chatId,
+          accountId: contact.accountId,
+          accountName: contact.accountName,
+          providerChatId: contact.providerChatId,
+          direction: "outbound",
+          type: "image",
+          mimeType: "image/png",
+          body: caption || "[报价单]",
+          status: "sent",
+          replyToId: quote.inboundMessageId || "",
+          metadata,
+          createdAt,
+          ...cachedFields
+        }).message;
+    this.publish("message", { chatId: quote.chatId, accountId: contact.accountId, message: row });
+    return row;
+  }
+
   async approveQuote(id, patch = {}) {
     const quoteId = Number(id);
-    if (this.approvals.has(quoteId)) throw Object.assign(new Error("该报价正在审批发送，请勿重复操作"), { statusCode: 409 });
-    this.approvals.add(quoteId);
+    const requestedQuoteIds = Array.isArray(patch.selectedQuoteIds) ? patch.selectedQuoteIds : [];
+    const editablePatch = { ...patch };
+    delete editablePatch.selectedQuoteIds;
+    const initialQuote = this.store.getQuote(quoteId);
+    if (!initialQuote) throw Object.assign(new Error("报价不存在"), { statusCode: 404 });
+    const initialGroup = this.quotationGroupQuotes(initialQuote, requestedQuoteIds);
+    const lockedIds = initialGroup.map((quote) => quote.id);
+    if (lockedIds.some((lockedId) => this.approvals.has(lockedId))) throw Object.assign(new Error("该报价组正在审批发送，请勿重复操作"), { statusCode: 409 });
+    for (const lockedId of lockedIds) this.approvals.add(lockedId);
     try {
       let quote = this.store.getQuote(quoteId);
-      if (!quote) throw Object.assign(new Error("报价不存在"), { statusCode: 404 });
       if (quote.status === "sent") throw Object.assign(new Error("该报价已经发送"), { statusCode: 409 });
       if (quote.status === "rejected") throw Object.assign(new Error("已驳回报价不能直接发送"), { statusCode: 409 });
-      quote = this.updateQuote(quoteId, patch);
-      if (quote.quoteType === "factory_inquiry" && !(Number(quote.basePriceCny) > 0)) {
+      quote = this.updateQuote(quoteId, editablePatch);
+      if (quote.quoteType === "factory_inquiry" && !quote.outOfStock && !(Number(quote.basePriceCny) > 0)) {
         throw Object.assign(new Error("该商品仍无货源价格，请先填写工厂确认价并修改发送文案"), { statusCode: 400 });
       }
       if (!quote.draftReply.trim()) throw Object.assign(new Error("报价发送文案不能为空"), { statusCode: 400 });
-      this.store.updateQuote(quoteId, { status: "approved", error: "" });
-      const sent = await this.sendText(quote.chatId, quote.draftReply, {
-        source: "quote-review",
-        replyToId: quote.inboundMessageId,
-        metadata: { quoteId, approvedPrice: quote.suggestedPrice, currency: quote.currency }
-      });
-      quote = this.store.updateQuote(quoteId, { status: "sent", sentMessageId: sent.id, error: "" });
+      this.syncQuotationGroupPricing(quote, initialGroup.map((item) => item.id));
+      const prepared = await this.prepareQuoteDocument(quoteId, null, { force: true, quoteIds: initialGroup.map((item) => item.id) });
+      quote = prepared.quote;
+      for (const item of prepared.quotes) this.store.updateQuote(item.id, { status: "approved", error: "" });
+      const sent = await this.sendQuoteDocument(quote, { ...prepared.document, buffer: prepared.buffer });
+      for (const item of prepared.quotes) {
+        const updated = this.store.updateQuote(item.id, {
+          status: "sent",
+          sentMessageId: sent.id,
+          quotationMessageId: sent.id,
+          quotationMediaUrl: sent.mediaUrl || prepared.document.mediaUrl,
+          quotationItemCount: prepared.document.itemCount,
+          quotationGroupQuoteIds: prepared.document.quoteIds,
+          error: ""
+        });
+        this.publish("quote", { chatId: updated.chatId, quote: updated });
+      }
+      this.store.refreshQuoteBatch(quote.quotationBatchId);
+      quote = this.store.getQuote(quoteId);
       this.clearHumanFlag(quote.chatId);
-      this.publish("quote", { chatId: quote.chatId, quote });
       return quote;
     } catch (error) {
-      const current = this.store.getQuote(quoteId);
-      if (current?.status === "approved" && !error.statusCode) this.store.updateQuote(quoteId, { error: `发送失败：${error.message}` });
+      if (!error.statusCode) {
+        for (const lockedId of lockedIds) {
+          const current = this.store.getQuote(lockedId);
+          if (current?.status === "approved") this.store.updateQuote(lockedId, { error: `发送失败：${error.message}` });
+        }
+      }
       throw error;
     } finally {
-      this.approvals.delete(quoteId);
+      for (const lockedId of lockedIds) this.approvals.delete(lockedId);
     }
   }
 

@@ -1,9 +1,10 @@
 const fs = require("fs");
 const path = require("path");
-const { isSystemConversation } = require("./message-policy");
+const { MANOS_LEAD_WELCOME, isSystemConversation } = require("./message-policy");
 const { MysqlStateDatabase } = require("./database");
 const { TestStateDatabase } = require("./test-state-database");
 const { DatabaseRemoteAuthStore } = require("./database-auth-store");
+const { normalizeQuotationNotes } = require("./quotation-notes");
 
 const DEFAULT_SETTINGS = {
   localAiProvider: "llama.cpp",
@@ -24,7 +25,7 @@ const DEFAULT_SETTINGS = {
 
 function emptyState() {
   return {
-    version: 17,
+    version: 23,
     nextQuoteId: 1,
     contacts: {},
     messages: [],
@@ -71,6 +72,41 @@ function defaultAccountPersona() {
   };
 }
 
+function defaultWelcomeFlow() {
+  return {
+    enabled: true,
+    steps: [{
+      id: "default-welcome-text",
+      type: "text",
+      text: MANOS_LEAD_WELCOME,
+      caption: "",
+      mediaUrl: "",
+      mimeType: "",
+      filename: ""
+    }]
+  };
+}
+
+function normalizeWelcomeFlow(value, fallback = defaultWelcomeFlow()) {
+  const input = value && typeof value === "object" ? value : fallback;
+  const steps = (Array.isArray(input.steps) ? input.steps : [])
+    .map((step, index) => {
+      const type = ["text", "image", "video"].includes(step?.type) ? step.type : "text";
+      return {
+        id: String(step?.id || `welcome-${Date.now()}-${index}`).replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 100),
+        type,
+        text: type === "text" ? String(step?.text || "").trim().slice(0, 4000) : "",
+        caption: type === "text" ? "" : String(step?.caption || "").trim().slice(0, 1000),
+        mediaUrl: type === "text" ? "" : String(step?.mediaUrl || "").trim().slice(0, 500),
+        mimeType: type === "text" ? "" : String(step?.mimeType || "").toLowerCase().split(";")[0].trim().slice(0, 100),
+        filename: type === "text" ? "" : String(step?.filename || "").replace(/[\\/:*?"<>|]/g, "_").slice(0, 180)
+      };
+    })
+    .filter((step) => step.type === "text" ? step.text : step.mediaUrl && step.mimeType.startsWith(`${step.type}/`))
+    .slice(0, 12);
+  return { enabled: input.enabled !== false, steps };
+}
+
 function defaultAccountAutomation(accountId) {
   return {
     accountId: String(accountId || ""),
@@ -91,6 +127,7 @@ function defaultAccountStyle(accountId) {
     status: "pending",
     summary: "",
     rules: [],
+    welcomeFlow: defaultWelcomeFlow(),
     persona: defaultAccountPersona(),
     sampleCount: 0,
     progress: 0,
@@ -125,6 +162,10 @@ function normalizeAccountStyle(current, patch = {}, accountId = "") {
     persona.updatedAt = Date.now();
     next.persona = persona;
   }
+  next.welcomeFlow = normalizeWelcomeFlow(
+    patch.welcomeFlow !== undefined ? patch.welcomeFlow : next.welcomeFlow,
+    current.welcomeFlow || defaultWelcomeFlow()
+  );
   next.summary = String(next.summary || "").trim().slice(0, 4000);
   next.progress = Math.max(0, Math.min(100, number(next.progress)));
   return next;
@@ -312,7 +353,7 @@ class Store {
           ...quote,
           basePriceCny: number(quote.basePriceCny ?? (quote.currency === "CNY" ? quote.suggestedPrice : 0)),
           shippingCny: [90, 150, 180, 300].includes(number(quote.shippingCny)) ? number(quote.shippingCny) : 90,
-          profitRate: Math.min(0.8, Math.max(0.7, number(quote.profitRate, 0.75))),
+          profitRate: Math.max(0, number(quote.profitRate, 0.75)),
           exchangeRate: number(quote.exchangeRate),
           rateDate: String(quote.rateDate || "")
         }));
@@ -382,6 +423,58 @@ class Store {
           sourceMessageIds: Array.isArray(memory.sourceMessageIds) ? memory.sourceMessageIds.map(String).slice(0, 12) : []
         }));
         state.version = 17;
+      }
+      if (Number(parsed.version || 0) < 18) {
+        state.quotes = state.quotes.map((quote) => ({
+          ...quote,
+          quotationMediaUrl: String(quote.quotationMediaUrl || ""),
+          quotationFilename: String(quote.quotationFilename || ""),
+          quotationGeneratedAt: number(quote.quotationGeneratedAt),
+          quotationMessageId: String(quote.quotationMessageId || "")
+        }));
+        state.version = 18;
+      }
+      if (Number(parsed.version || 0) < 19) {
+        state.quotes = state.quotes.map((quote) => ({
+          ...quote,
+          quotationBatchId: String(quote.quotationBatchId || `quote-batch-${quote.id}`),
+          quotationItemCount: Math.max(1, number(quote.quotationItemCount, 1)),
+          quotationGroupQuoteIds: Array.isArray(quote.quotationGroupQuoteIds) && quote.quotationGroupQuoteIds.length
+            ? quote.quotationGroupQuoteIds.map(Number).filter(Number.isFinite)
+            : [number(quote.id)]
+        }));
+        state.version = 19;
+      }
+      if (Number(parsed.version || 0) < 20) {
+        state.quotes = state.quotes.map((quote) => ({
+          ...quote,
+          manualPriceOverride: Boolean(quote.manualPriceOverride)
+        }));
+        state.version = 20;
+      }
+      if (Number(parsed.version || 0) < 21) {
+        state.quotes = state.quotes.map((quote) => ({
+          ...quote,
+          quotationNotes: normalizeQuotationNotes(quote.quotationNotes, quote.productFacts)
+        }));
+        state.version = 21;
+      }
+      if (Number(parsed.version || 0) < 22) {
+        state.quotes = state.quotes.map((quote) => ({
+          ...quote,
+          outOfStock: Boolean(quote.outOfStock),
+          stockPreviousDraftReply: String(quote.stockPreviousDraftReply || "")
+        }));
+        state.version = 22;
+      }
+      if (Number(parsed.version || 0) < 23) {
+        for (const [agentId, agent] of Object.entries(state.agents)) {
+          state.agents[agentId] = defaultAgent(agentId, agent.name, agent);
+        }
+        for (const [accountId, style] of Object.entries(state.accountStyles)) {
+          state.accountStyles[accountId] = normalizeAccountStyle(defaultAccountStyle(accountId), style, accountId);
+        }
+        state.version = 23;
       }
       this.database.persistState(state);
       if (source === "legacy-json") this.legacyBackupPath = this.database.backupLegacyJson(this.filePath);
@@ -922,7 +1015,14 @@ class Store {
     const row = this.state.accountStyles[id];
     const fallback = defaultAccountStyle(id);
     const source = agent || row;
-    const style = source ? { ...fallback, ...source, accountId: id, persona: { ...fallback.persona, ...(source.persona || {}) }, rules: (source.rules || []).map((rule) => ({ ...rule })) } : fallback;
+    const style = source ? {
+      ...fallback,
+      ...source,
+      accountId: id,
+      persona: { ...fallback.persona, ...(source.persona || {}) },
+      rules: (source.rules || []).map((rule) => ({ ...rule })),
+      welcomeFlow: normalizeWelcomeFlow(source.welcomeFlow, fallback.welcomeFlow)
+    } : fallback;
     if (agent) {
       style.agentId = agent.id;
       style.agentName = agent.name;
@@ -1183,23 +1283,37 @@ class Store {
     const existing = this.getQuoteByInboundMessage(data.chatId, data.inboundMessageId);
     if (existing) return { ...existing, reusedExisting: true };
     const now = Date.now();
+    const nextId = this.state.nextQuoteId++;
+    const sourceMessage = this.getMessage(data.chatId, data.inboundMessageId);
+    const sourceCreatedAt = number(sourceMessage?.createdAt, now);
+    const quoteType = data.quoteType === "factory_inquiry" ? "factory_inquiry" : "priced";
+    const recentBatchQuote = this.state.quotes
+      .filter((quote) => quote.chatId === String(data.chatId || "") && ["pending", "approved"].includes(quote.status) && quote.quoteType === quoteType)
+      .sort((a, b) => number(b.createdAt) - number(a.createdAt))[0];
+    const recentMessage = recentBatchQuote ? this.getMessage(recentBatchQuote.chatId, recentBatchQuote.inboundMessageId) : null;
+    const sameBurst = recentBatchQuote && Math.abs(sourceCreatedAt - number(recentMessage?.createdAt, recentBatchQuote.createdAt)) <= 2 * 60 * 1000;
+    const quotationBatchId = String(data.quotationBatchId || (sameBurst ? recentBatchQuote.quotationBatchId : "") || `quote-batch-${nextId}-${now}`);
     const row = {
-      id: this.state.nextQuoteId++,
+      id: nextId,
       chatId: String(data.chatId || ""),
       inboundMessageId: String(data.inboundMessageId || ""),
       imageMediaUrl: String(data.imageMediaUrl || ""),
-      quoteType: data.quoteType === "factory_inquiry" ? "factory_inquiry" : "priced",
+      quoteType,
       supplier: String(data.supplier || "微店共享货源"),
       searchStatus: String(data.searchStatus || "completed"),
       products: Array.isArray(data.products) ? data.products : [],
       productFacts: data.productFacts || null,
+      quotationNotes: normalizeQuotationNotes(data.quotationNotes, data.productFacts),
       costMin: number(data.costMin),
       costMax: number(data.costMax),
       suggestedPrice: number(data.suggestedPrice),
       currency: String(data.currency || this.state.settings.quoteCurrency || "CNY"),
       basePriceCny: number(data.basePriceCny ?? data.suggestedPrice),
       shippingCny: number(data.shippingCny || 90),
-      profitRate: number(data.profitRate || 0.75),
+      profitRate: Math.max(0, number(data.profitRate, 0.75)),
+      manualPriceOverride: Boolean(data.manualPriceOverride),
+      outOfStock: Boolean(data.outOfStock),
+      stockPreviousDraftReply: String(data.stockPreviousDraftReply || ""),
       exchangeRate: number(data.exchangeRate),
       rateDate: String(data.rateDate || ""),
       draftReply: String(data.draftReply || ""),
@@ -1212,11 +1326,24 @@ class Store {
       draftLanguage: String(data.draftLanguage || ""),
       status: "pending",
       reviewerNote: "",
+      quotationMediaUrl: "",
+      quotationFilename: "",
+      quotationGeneratedAt: 0,
+      quotationMessageId: "",
+      quotationBatchId,
+      quotationItemCount: 1,
+      quotationGroupQuoteIds: [nextId],
       error: String(data.error || ""),
       createdAt: now,
       updatedAt: now
     };
     this.state.quotes.push(row);
+    const batchQuotes = this.state.quotes.filter((quote) => quote.quotationBatchId === quotationBatchId && ["pending", "approved"].includes(quote.status));
+    const batchQuoteIds = batchQuotes.map((quote) => quote.id).sort((a, b) => a - b);
+    for (const batchQuote of batchQuotes) {
+      batchQuote.quotationItemCount = batchQuoteIds.length;
+      batchQuote.quotationGroupQuoteIds = [...batchQuoteIds];
+    }
     const contact = this.state.contacts[row.chatId];
     if (contact) {
       contact.needsHuman = true;
@@ -1267,17 +1394,37 @@ class Store {
   updateQuote(id, patch = {}) {
     const row = this.state.quotes.find((item) => item.id === Number(id));
     if (!row) return null;
-    const allowed = ["suggestedPrice", "currency", "basePriceCny", "shippingCny", "profitRate", "exchangeRate", "rateDate", "draftReply", "reviewerNote", "status", "sentMessageId", "rejectionReply", "rejectedMessageId", "error", "acknowledgementSentMessageId", "acknowledgementDeferred", "acknowledgementDeferredReason", "replyLanguage", "customerLanguage", "draftLanguage", "imageMediaUrl", "quoteType", "supplier", "searchStatus", "products", "productFacts", "costMin", "costMax", "acknowledgement"];
+    const allowed = ["suggestedPrice", "manualPriceOverride", "outOfStock", "stockPreviousDraftReply", "currency", "basePriceCny", "shippingCny", "profitRate", "exchangeRate", "rateDate", "draftReply", "reviewerNote", "status", "sentMessageId", "rejectionReply", "rejectedMessageId", "error", "acknowledgementSentMessageId", "acknowledgementDeferred", "acknowledgementDeferredReason", "replyLanguage", "customerLanguage", "draftLanguage", "imageMediaUrl", "quoteType", "supplier", "searchStatus", "products", "productFacts", "quotationNotes", "costMin", "costMax", "acknowledgement", "quotationMediaUrl", "quotationFilename", "quotationGeneratedAt", "quotationMessageId", "quotationBatchId", "quotationItemCount", "quotationGroupQuoteIds"];
     for (const key of allowed) if (Object.prototype.hasOwnProperty.call(patch, key)) row[key] = patch[key];
     row.updatedAt = Date.now();
     this.save();
     return this.quoteWithLanguage(row);
   }
 
+  refreshQuoteBatch(batchId) {
+    const key = String(batchId || "");
+    if (!key) return [];
+    const openQuotes = this.state.quotes
+      .filter((quote) => quote.quotationBatchId === key && ["pending", "approved"].includes(quote.status))
+      .sort((a, b) => number(a.createdAt) - number(b.createdAt) || number(a.id) - number(b.id));
+    const openIds = openQuotes.map((quote) => quote.id);
+    for (const quote of openQuotes) {
+      quote.quotationItemCount = Math.max(1, openIds.length);
+      quote.quotationGroupQuoteIds = [...openIds];
+      quote.quotationMediaUrl = "";
+      quote.quotationFilename = "";
+      quote.quotationGeneratedAt = 0;
+      quote.updatedAt = Date.now();
+    }
+    this.save();
+    return openQuotes.map((quote) => this.quoteWithLanguage(quote));
+  }
+
   deleteQuote(id) {
     const index = this.state.quotes.findIndex((item) => item.id === Number(id));
     if (index < 0) return null;
     const [removed] = this.state.quotes.splice(index, 1);
+    this.refreshQuoteBatch(removed.quotationBatchId);
     const linked = this.state.quotes.filter((quote) => quote.chatId === removed.chatId && quote.inboundMessageId === removed.inboundMessageId);
     const message = this.state.messages.find((item) => item.chatId === removed.chatId && item.id === removed.inboundMessageId);
     if (message?.metadata?.automationState === "quote_pending") {

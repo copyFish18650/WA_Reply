@@ -141,8 +141,26 @@ app.post("/api/agents", (req, res) => {
   try { res.json({ ok: true, agent: service.createAgent(req.body || {}) }); } catch (error) { fail(res, error); }
 });
 
+app.post("/api/agents/import", express.raw({ type: ["application/zip", "application/octet-stream", "application/x-zip-compressed"], limit: "200mb" }), async (req, res) => {
+  try { res.json({ ok: true, agent: await service.importAgentPackage(req.body) }); } catch (error) { fail(res, error); }
+});
+
+app.get("/api/agents/:agentId/export", async (req, res) => {
+  try {
+    const exported = await service.exportAgentPackage(req.params.agentId);
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Length", exported.buffer.length);
+    res.setHeader("Content-Disposition", `attachment; filename="agent.wa-agent"; filename*=UTF-8''${encodeURIComponent(exported.filename)}`);
+    res.send(exported.buffer);
+  } catch (error) { fail(res, error); }
+});
+
 app.put("/api/agents/:agentId", (req, res) => {
   try { res.json({ ok: true, agent: service.updateAgent(req.params.agentId, req.body || {}) }); } catch (error) { fail(res, error); }
+});
+
+app.post("/api/agents/:agentId/welcome-media", (req, res) => {
+  try { res.json({ ok: true, asset: service.uploadAgentWelcomeMedia(req.params.agentId, req.body || {}) }); } catch (error) { fail(res, error); }
 });
 
 app.post("/api/agents/:agentId/clone", (req, res) => {
@@ -278,6 +296,16 @@ app.delete("/api/quotes/:id", (req, res) => {
 
 app.post("/api/quotes/:id/search", async (req, res) => {
   try { res.json({ ok: true, quote: await service.retryQuoteSearch(req.params.id) }); } catch (error) { fail(res, error); }
+});
+
+app.post("/api/quotes/:id/document", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const patch = { ...body };
+    delete patch.selectedQuoteIds;
+    const result = await service.prepareQuoteDocument(req.params.id, patch, { force: true, quoteIds: body.selectedQuoteIds });
+    res.json({ ok: true, quote: result.quote, document: result.document });
+  } catch (error) { fail(res, error); }
 });
 
 app.post("/api/quotes/:id/approve", async (req, res) => {

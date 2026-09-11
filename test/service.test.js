@@ -5,6 +5,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const EventEmitter = require("events");
+const sharp = require("sharp");
 const { Store, contextKeywords } = require("../src/store");
 const { SalesService, conversationKey, needsChineseTranslation, detectLanguage } = require("../src/service");
 const {
@@ -20,22 +21,25 @@ const { AccountSession, WhatsAppSessionManager, messageId, messageFromMe, normal
 const unzipper = require("unzipper");
 const { SupplierSearch, aggregateProductFacts } = require("../src/supplier");
 const { calculateFinalQuote } = require("../src/pricing");
-const { MANOS_LEAD_WELCOME, NEW_CUSTOMER_WELCOME, isGreeting } = require("../src/message-policy");
+const { MANOS_LEAD_WELCOME, isGreeting } = require("../src/message-policy");
 
 class FakeSession extends EventEmitter {
   constructor() {
     super();
     this.sent = [];
     this.sentMedia = [];
+    this.sentSequence = [];
   }
   getStatus() { return { status: "ready", message: "mock", accounts: [{ accountId: "primary", status: "ready" }] }; }
   async sendText(accountId, chatId, body) {
     this.sent.push({ accountId, chatId, body });
+    this.sentSequence.push({ type: "text", accountId, chatId, body });
     await new Promise((resolve) => setTimeout(resolve, 10));
     return { id: `sent-${this.sent.length}`, createdAt: Date.now() };
   }
   async sendMedia(accountId, chatId, media) {
     this.sentMedia.push({ accountId, chatId, media });
+    this.sentSequence.push({ type: media.mimeType.startsWith("video/") ? "video" : "image", accountId, chatId, media });
     return { id: `sent-media-${this.sentMedia.length}`, createdAt: Date.now() };
   }
 }
@@ -97,7 +101,7 @@ test("旧 JSON 数据首次启动会完整迁移到持久层，后续只从数�
       }
     },
     messages: [{ id: "legacy-message", chatId, accountId: "primary", direction: "inbound", type: "text", body: "Hello", createdAt: 1000, updatedAt: 1000 }],
-    quotes: [],
+    quotes: [{ id: 1, chatId, inboundMessageId: "legacy-message", status: "pending", productFacts: null, suggestedPrice: 120, currency: "USD", createdAt: 1000, updatedAt: 1000 }],
     accountStyles: {},
     agents: {},
     accountAgentBindings: {},
@@ -113,6 +117,7 @@ test("旧 JSON 数据首次启动会完整迁移到持久层，后续只从数�
   assert.equal(store.getMessage(chatId, "legacy-message").body, "Hello");
   assert.equal(store.getDatabaseStatus().integrity, "ok");
   assert.equal(store.getDatabaseStatus().counts.messages, 1);
+  assert.equal(store.getQuote(1).quotationNotes.some((note) => note.id === "shipping_included"), true);
   assert.equal(fs.readdirSync(path.join(root, "backups")).some((name) => /^state-pre-mysql-.*\.json$/.test(name)), true);
   store.close();
   store = null;
@@ -480,19 +485,31 @@ test("图片估价只进入待审核，审批时才发送且防止重复", async
   assert.equal(pending[0].productFacts.dimensions.zh, "开口宽约 48 cm、高约 25 cm、厚约 1 cm");
   assert.match(pending[0].draftReply, /48 cm across the opening/);
   assert.match(pending[0].draftReply, /adjustable shoulder strap/);
-  assert.equal(session.sent.length, 0);
+  assert.equal(session.sent.length, 1);
+  assert.equal(session.sent[0].body, "Please wait a moment, dear. I’ll check with the factory and prepare a quotation for you.");
+  assert.equal(pending[0].quotationNotes.some((note) => note.id === "shipping_included" && note.zh === "含运费"), true);
+  const notesWithoutZipper = pending[0].quotationNotes.filter((note) => note.id !== "zipper");
   const results = await Promise.allSettled([
-    service.approveQuote(pending[0].id, { draftReply: "审核后的报价是 CNY 128.00", suggestedPrice: 128 }),
+    service.approveQuote(pending[0].id, { draftReply: "审核后的报价是 CNY 128.00", suggestedPrice: 128, quotationNotes: notesWithoutZipper }),
     service.approveQuote(pending[0].id, { draftReply: "不应重复发送" })
   ]);
   assert.equal(results.filter((item) => item.status === "fulfilled").length, 1);
   assert.equal(session.sent.length, 1);
-  assert.deepEqual(session.sent[0], {
-    accountId: "primary",
-    chatId,
-    body: "审核后的报价是 CNY 128.00"
-  });
-  assert.equal(store.getQuote(pending[0].id).status, "sent");
+  assert.equal(session.sentMedia.length, 1);
+  assert.equal(session.sentMedia[0].accountId, "primary");
+  assert.equal(session.sentMedia[0].chatId, chatId);
+  assert.equal(session.sentMedia[0].media.mimeType, "image/png");
+  assert.equal(session.sentMedia[0].media.caption, "审核后的报价是 CNY 128.00");
+  assert.match(session.sentMedia[0].media.filename, /^manos-quotation-/);
+  assert.ok(Buffer.from(session.sentMedia[0].media.data, "base64").length > 1000);
+  const sentQuote = store.getQuote(pending[0].id);
+  assert.equal(sentQuote.status, "sent");
+  assert.equal(sentQuote.quotationNotes.some((note) => note.id === "zipper"), false);
+  assert.match(sentQuote.quotationMediaUrl, /^\/media\//);
+  assert.equal(sentQuote.quotationMessageId, sentQuote.sentMessageId);
+  const sentMessage = store.getMessage(sentQuote.chatId, sentQuote.sentMessageId);
+  assert.equal(sentMessage.type, "image");
+  assert.equal(sentMessage.metadata.quotationDocument, true);
 });
 
 test("同一张图片并发或补处理时只保留一个报价任务", async (t) => {
@@ -575,6 +592,64 @@ test("最终报价按基础价、运费和利润计算并四舍五入为目标�
   assert.equal(quote.currency, "USD");
 });
 
+test("报价审核允许超出 70%–80% 的自定义利润率", () => {
+  const quote = calculateFinalQuote({
+    basePriceCny: 100,
+    shippingCny: 90,
+    profitRate: 1.25,
+    currency: "USD",
+    rates: { USD: 1 }
+  });
+  assert.equal(quote.profitRate, 1.25);
+  assert.equal(quote.profitCny, 125);
+  assert.equal(quote.subtotalCny, 315);
+  assert.equal(quote.suggestedPrice, 315);
+});
+
+test("手动最终价优先于公式试算并持久保留", (t) => {
+  const { store, service } = fixture(t);
+  const chatId = "manual-final-price@c.us";
+  store.upsertContact(chatId, { profileName: "手动价格客户" });
+  const quote = store.createQuote({
+    chatId,
+    inboundMessageId: "manual-price-image",
+    quoteType: "priced",
+    basePriceCny: 100,
+    shippingCny: 90,
+    profitRate: 0.75,
+    exchangeRate: 1,
+    suggestedPrice: 265,
+    currency: "USD",
+    draftReply: "Dear, the final price is USD 265."
+  });
+  const updated = service.updateQuote(quote.id, {
+    basePriceCny: 100,
+    shippingCny: 90,
+    profitRate: 1.25,
+    exchangeRate: 1,
+    currency: "USD",
+    suggestedPrice: 399
+  });
+  assert.equal(updated.profitRate, 1.25);
+  assert.equal(updated.suggestedPrice, 399);
+  assert.equal(updated.manualPriceOverride, true);
+  const noteOnly = service.updateQuote(quote.id, { reviewerNote: "keep override" });
+  assert.equal(noteOnly.suggestedPrice, 399);
+  assert.equal(noteOnly.manualPriceOverride, true);
+});
+
+test("报价货币与 Manos 模板一致并支持澳元", () => {
+  const quote = calculateFinalQuote({
+    basePriceCny: 416,
+    shippingCny: 90,
+    profitRate: 0.75,
+    currency: "AUD",
+    rates: { AUD: 0.215054 }
+  });
+  assert.equal(quote.currency, "AUD");
+  assert.equal(quote.suggestedPrice, 176);
+});
+
 test("驳回报价会发送工厂暂时缺货通知且防止重复", async (t) => {
   const { store, session, service } = fixture(t);
   const chatId = "quote-reject@c.us";
@@ -597,7 +672,7 @@ test("驳回报价会发送工厂暂时缺货通知且防止重复", async (t) =
   assert.equal(session.sent.at(-1).body, "抱歉亲爱的，这款工厂告诉我暂时缺货。");
   assert.equal(store.getQuote(quote.id).status, "rejected");
   await assert.rejects(() => service.rejectQuote(quote.id), /已经驳回并通知客户/);
-  assert.equal(session.sent.length, 1);
+  assert.equal(session.sent.length, 2);
 });
 
 test("搜图没有价格时告知客户并建立待询厂任务", async (t) => {
@@ -620,7 +695,7 @@ test("搜图没有价格时告知客户并建立待询厂任务", async (t) => {
   assert.equal(quote.suggestedPrice, 0);
   assert.equal(quote.products.length, 1);
   assert.equal(session.sent.length, 1);
-  assert.equal(session.sent[0].body, "Okay dear, I’ll check with the factory for you.");
+  assert.equal(session.sent[0].body, "Please wait a moment, dear. I’ll check with the factory and prepare a quotation for you.");
   await assert.rejects(() => service.approveQuote(quote.id, {}), /先填写工厂确认价/);
   assert.equal(session.sent.length, 1);
 });
@@ -638,7 +713,8 @@ test("历史图片占位符不会被误判为中文，报价默认跟随客户�
   assert.equal(quote.customerLanguage, "en");
   assert.equal(quote.draftLanguage, "en");
   assert.match(quote.draftReply, /preliminary price/i);
-  assert.equal(session.sent.length, 0);
+  assert.equal(session.sent.length, 1);
+  assert.match(session.sent[0].body, /prepare a quotation/i);
 });
 
 test("报价语言可手动转换并持久化", async (t) => {
@@ -1146,7 +1222,7 @@ test("人工回复按钮也不能对已有后续出站消息的旧消息重复�
   assert.equal(session.sent.length, 0);
 });
 
-test("WhatsApp 实时事件收到新客户首次招呼后立即发送固定欢迎语", async (t) => {
+test("WhatsApp 实时事件收到新客户首次招呼后立即发送智能体默认接待流程", async (t) => {
   const { store, session, service } = fixture(t);
   let aiCalled = false;
   service.ai.decide = async () => { aiCalled = true; return { action: "reply", reply: "不应调用", confidence: 1 }; };
@@ -1171,11 +1247,117 @@ test("WhatsApp 实时事件收到新客户首次招呼后立即发送固定欢�
     createdAt: Date.now()
   });
   await completed;
-  assert.equal(session.sent[0].body, NEW_CUSTOMER_WELCOME);
+  assert.equal(session.sent[0].body, MANOS_LEAD_WELCOME);
   const outbound = store.listMessages(conversationKey("primary", "new-customer@c.us"), { markRead: false }).find((item) => item.direction === "outbound");
   assert.equal(outbound.metadata.source, "new-customer-welcome");
   assert.equal(aiCalled, false);
   assert.equal(store.getMessage(conversationKey("primary", "new-customer@c.us"), "first-hello").metadata.automationState, "replied");
+});
+
+test("智能体首次接待流程可配置多段文字、图片和视频并严格按顺序发送", async (t) => {
+  const { store, session, service } = fixture(t);
+  const image = service.uploadAgentWelcomeMedia(store.ensureAccountAgent("primary").id, {
+    data: Buffer.from("welcome-image").toString("base64"),
+    mimeType: "image/png",
+    filename: "catalog.png"
+  });
+  const video = service.uploadAgentWelcomeMedia(store.ensureAccountAgent("primary").id, {
+    data: Buffer.from("welcome-video").toString("base64"),
+    mimeType: "video/mp4",
+    filename: "intro.mp4"
+  });
+  store.updateAccountStyle("primary", {
+    welcomeFlow: {
+      enabled: true,
+      steps: [
+        { id: "hello", type: "text", text: "Welcome, dear!" },
+        { id: "catalog", ...image, caption: "Here is our catalog." },
+        { id: "question", type: "text", text: "What products are you looking for?" },
+        { id: "intro", ...video, caption: "A short introduction." }
+      ]
+    }
+  });
+  await service.ingest({
+    id: "multi-step-welcome",
+    accountId: "primary",
+    accountName: "Manos Amy",
+    chatId: "ordered-welcome@c.us",
+    profileName: "New customer",
+    type: "text",
+    body: "Hello",
+    createdAt: Date.now()
+  });
+  assert.deepEqual(session.sentSequence.map((item) => item.type), ["text", "image", "text", "video"]);
+  assert.equal(session.sentSequence[0].body, "Welcome, dear!");
+  assert.equal(session.sentSequence[1].media.caption, "Here is our catalog.");
+  assert.equal(session.sentSequence[2].body, "What products are you looking for?");
+  assert.equal(session.sentSequence[3].media.caption, "A short introduction.");
+  const inbound = store.getMessage(conversationKey("primary", "ordered-welcome@c.us"), "multi-step-welcome");
+  assert.equal(inbound.metadata.automationState, "replied");
+  assert.deepEqual(inbound.metadata.welcomeCompletedStepIds, ["hello", "catalog", "question", "intro"]);
+  const outbound = store.listMessages(conversationKey("primary", "ordered-welcome@c.us"), { markRead: false }).filter((item) => item.direction === "outbound");
+  assert.deepEqual(outbound.map((item) => item.type), ["text", "image", "text", "video"]);
+});
+
+test("首次接待流程配置随可复用智能体持久化并复制", (t) => {
+  const { store } = fixture(t);
+  const agent = store.ensureAccountAgent("primary", "Welcome Agent");
+  store.updateAgent(agent.id, {
+    welcomeFlow: { enabled: true, steps: [
+      { id: "one", type: "text", text: "First" },
+      { id: "two", type: "text", text: "Second" }
+    ] }
+  });
+  const clone = store.createAgent({ copyFromAgentId: agent.id, name: "Welcome Agent Copy" });
+  assert.deepEqual(clone.welcomeFlow.steps.map((step) => step.text), ["First", "Second"]);
+  store.bindAccountAgent("secondary", clone.id);
+  assert.deepEqual(store.getAccountStyle("secondary").welcomeFlow.steps.map((step) => step.id), ["one", "two"]);
+});
+
+test("首次接待媒体中途失败会转人工，修复后只续发未完成步骤", async (t) => {
+  const { store, session, service } = fixture(t);
+  const agent = store.ensureAccountAgent("primary");
+  store.updateAgent(agent.id, {
+    welcomeFlow: { enabled: true, steps: [
+      { id: "sent-text", type: "text", text: "Hello, dear!" },
+      { id: "missing-image", type: "image", mediaUrl: "/media/missing.png", mimeType: "image/png", filename: "missing.png" }
+    ] }
+  });
+  const input = {
+    id: "resumable-welcome",
+    accountId: "primary",
+    accountName: "Manos Amy",
+    chatId: "resume-welcome@c.us",
+    profileName: "New customer",
+    type: "text",
+    body: "Hi",
+    createdAt: Date.now()
+  };
+  await service.ingest(input);
+  const chatId = conversationKey("primary", input.chatId);
+  let inbound = store.getMessage(chatId, input.id);
+  assert.equal(session.sent.length, 1);
+  assert.deepEqual(inbound.metadata.welcomeCompletedStepIds, ["sent-text"]);
+  assert.equal(inbound.metadata.automationState, "failed");
+  assert.equal(store.getContact(chatId).needsHuman, true);
+
+  const fixedImage = service.uploadAgentWelcomeMedia(agent.id, {
+    data: Buffer.from("fixed-image").toString("base64"),
+    mimeType: "image/png",
+    filename: "fixed.png"
+  });
+  store.updateAgent(agent.id, {
+    welcomeFlow: { enabled: true, steps: [
+      { id: "sent-text", type: "text", text: "Hello, dear!" },
+      { id: "missing-image", ...fixedImage }
+    ] }
+  });
+  await service.replyToMessage(chatId, input.id);
+  inbound = store.getMessage(chatId, input.id);
+  assert.equal(session.sent.length, 1);
+  assert.equal(session.sentMedia.length, 1);
+  assert.equal(inbound.metadata.automationState, "replied");
+  assert.deepEqual(inbound.metadata.welcomeCompletedStepIds, ["sent-text", "missing-image"]);
 });
 
 test("只有纯招呼触发新客欢迎，带具体需求的消息交给上下文 AI", async (t) => {
@@ -1272,7 +1454,7 @@ test("同一客户连续多条排队消息合并为一次上下文回复", async
   assert.equal(store.getMessage(conversationKey("primary", "merge@c.us"), "merge-new").metadata.automationState, "replied");
 });
 
-test("同一客户连续发送多张商品图会逐张建立报价审核", async (t) => {
+test("同一客户连续发送多张商品图会逐项审核并合并为一张总价报价单", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wa-multi-product-"));
   const store = new Store(root);
   t.after(() => {
@@ -1310,7 +1492,219 @@ test("同一客户连续发送多张商品图会逐张建立报价审核", async
   assert.equal(quotes.length, 3);
   assert.deepEqual(new Set(quotes.map((quote) => quote.inboundMessageId)), new Set(["multi-image-1", "multi-image-2", "multi-image-3"]));
   assert.equal(quotes.every((quote) => quote.status === "pending"), true);
-  assert.equal(session.sent.length, 0);
+  assert.equal(new Set(quotes.map((quote) => quote.quotationBatchId)).size, 1);
+  assert.equal(quotes.every((quote) => quote.quotationItemCount === 3), true);
+  assert.equal(session.sent.length, 1);
+  assert.match(session.sent[0].body, /prepare a quotation/i);
+  assert.equal(new Set(quotes.map((quote) => quote.acknowledgementSentMessageId)).size, 1);
+  assert.equal(quotes.every((quote) => Boolean(quote.acknowledgementSentMessageId)), true);
+
+  const approved = await service.approveQuote(quotes[0].id, {
+    basePriceCny: 260,
+    shippingCny: 90,
+    profitRate: 0.75,
+    currency: "GBP",
+    exchangeRate: 0.1,
+    suggestedPrice: 73,
+    rateDate: "2026-09-09",
+    draftReply: "Dear, please find the quotation attached."
+  });
+  assert.equal(approved.status, "sent");
+  assert.equal(session.sentMedia.length, 1);
+  assert.equal(session.sentMedia[0].media.caption, "Dear, this is the factory's quotation for the products you selected. Please check it and let me know if anything needs to be adjusted.");
+  assert.doesNotMatch(session.sentMedia[0].media.caption, /\b(?:GBP|USD|EUR|AUD|CNY)\s*\d/i);
+  const quotationBuffer = Buffer.from(session.sentMedia[0].media.data, "base64");
+  const metadata = await sharp(quotationBuffer).metadata();
+  assert.equal(metadata.width, 1970);
+  assert.equal(metadata.height, 1352);
+  const sentQuotes = store.listQuotes("all", chatId);
+  assert.equal(sentQuotes.every((quote) => quote.status === "sent"), true);
+  assert.equal(sentQuotes.every((quote) => quote.quotationMessageId === approved.quotationMessageId), true);
+  assert.equal(sentQuotes.every((quote) => quote.quotationItemCount === 3), true);
+  const sentMessage = store.getMessage(chatId, approved.quotationMessageId);
+  assert.deepEqual(new Set(sentMessage.metadata.quoteIds), new Set(sentQuotes.map((quote) => quote.id)));
+  assert.equal(sentMessage.metadata.quotationItemCount, 3);
+  assert.equal(sentMessage.metadata.approvedTotal, 183);
+});
+
+test("多商品报价可勾选一件或多件，未勾选商品继续留待审", async (t) => {
+  const { store, session, service } = fixture(t);
+  const chatId = "selective-quotation@c.us";
+  store.upsertContact(chatId, {
+    accountId: "primary",
+    accountName: "Manos",
+    providerChatId: chatId,
+    profileName: "Selective Buyer"
+  });
+  const quotes = [100, 200, 300].map((basePriceCny, index) => store.createQuote({
+    chatId,
+    inboundMessageId: `selective-image-${index + 1}`,
+    quotationBatchId: "selective-batch",
+    quoteType: "priced",
+    basePriceCny,
+    shippingCny: 90,
+    profitRate: 0,
+    exchangeRate: 1,
+    suggestedPrice: basePriceCny + 90,
+    currency: "USD",
+    draftReply: "Dear, please find the quotation attached."
+  }));
+  const otherChatId = "other-selective-customer@c.us";
+  store.upsertContact(otherChatId, { accountId: "primary", providerChatId: otherChatId, profileName: "Other Buyer" });
+  const foreignQuote = store.createQuote({
+    chatId: otherChatId,
+    inboundMessageId: "foreign-image",
+    quotationBatchId: "foreign-batch",
+    quoteType: "priced",
+    basePriceCny: 50,
+    suggestedPrice: 140,
+    currency: "USD",
+    draftReply: "Foreign quote"
+  });
+  await assert.rejects(
+    () => service.approveQuote(quotes[0].id, { selectedQuoteIds: [quotes[0].id, foreignQuote.id] }),
+    /同一客户/
+  );
+  assert.equal(session.sentMedia.length, 0);
+
+  await service.approveQuote(quotes[0].id, {
+    selectedQuoteIds: [quotes[0].id, quotes[1].id],
+    basePriceCny: 100,
+    shippingCny: 90,
+    profitRate: 0,
+    exchangeRate: 1,
+    suggestedPrice: 190,
+    currency: "USD",
+    draftReply: "Dear, please find the quotation attached."
+  });
+
+  assert.equal(session.sentMedia.length, 1);
+  assert.equal(store.getQuote(quotes[0].id).status, "sent");
+  assert.equal(store.getQuote(quotes[1].id).status, "sent");
+  assert.equal(store.getQuote(quotes[2].id).status, "pending");
+  assert.equal(store.getQuote(quotes[2].id).quotationItemCount, 1);
+  const sentMessage = store.getMessage(chatId, store.getQuote(quotes[0].id).quotationMessageId);
+  assert.deepEqual(sentMessage.metadata.quoteIds, [quotes[0].id, quotes[1].id]);
+  assert.equal(sentMessage.metadata.quotationItemCount, 2);
+  assert.equal(sentMessage.metadata.approvedTotal, 480);
+
+  await service.approveQuote(quotes[2].id, {
+    selectedQuoteIds: [quotes[2].id],
+    basePriceCny: 300,
+    shippingCny: 90,
+    profitRate: 0,
+    exchangeRate: 1,
+    suggestedPrice: 390,
+    currency: "USD",
+    draftReply: "Dear, please find the quotation attached."
+  });
+  assert.equal(session.sentMedia.length, 2);
+  assert.equal(store.getQuote(quotes[2].id).status, "sent");
+});
+
+test("缺货是可持久化的商品状态，报价单不计价格且其他商品照常汇总", async (t) => {
+  const { store, session, service } = fixture(t);
+  const chatId = "stock-state-quotation@c.us";
+  store.upsertContact(chatId, {
+    accountId: "primary",
+    accountName: "Manos",
+    providerChatId: chatId,
+    profileName: "Stock Buyer"
+  });
+  const available = store.createQuote({
+    chatId,
+    inboundMessageId: "available-image",
+    quotationBatchId: "stock-state-batch",
+    quoteType: "priced",
+    basePriceCny: 100,
+    shippingCny: 90,
+    profitRate: 0,
+    exchangeRate: 1,
+    suggestedPrice: 190,
+    currency: "USD",
+    draftReply: "Dear, please find the quotation attached."
+  });
+  const unavailable = store.createQuote({
+    chatId,
+    inboundMessageId: "unavailable-image",
+    quotationBatchId: "stock-state-batch",
+    quoteType: "priced",
+    basePriceCny: 200,
+    shippingCny: 90,
+    profitRate: 0,
+    exchangeRate: 1,
+    suggestedPrice: 290,
+    currency: "USD",
+    draftReply: "Dear, this was the original priced reply."
+  });
+
+  const marked = service.updateQuote(unavailable.id, {
+    outOfStock: true,
+    suggestedPrice: 0,
+    draftReply: "Sorry dear, this item is currently out of stock."
+  });
+  assert.equal(marked.outOfStock, true);
+  assert.equal(marked.suggestedPrice, 0);
+  assert.equal(marked.stockPreviousDraftReply, "Dear, this was the original priced reply.");
+
+  await service.approveQuote(available.id, {
+    selectedQuoteIds: [available.id, unavailable.id],
+    basePriceCny: 100,
+    shippingCny: 90,
+    profitRate: 0,
+    exchangeRate: 1,
+    suggestedPrice: 190,
+    currency: "USD",
+    draftReply: "Dear, please find the quotation attached."
+  });
+
+  assert.equal(session.sentMedia.length, 1);
+  const sentAvailable = store.getQuote(available.id);
+  const sentUnavailable = store.getQuote(unavailable.id);
+  assert.equal(sentAvailable.status, "sent");
+  assert.equal(sentUnavailable.status, "sent");
+  assert.equal(sentUnavailable.outOfStock, true);
+  assert.equal(sentUnavailable.suggestedPrice, 0);
+  const sentMessage = store.getMessage(chatId, sentAvailable.quotationMessageId);
+  assert.equal(sentMessage.metadata.quotationItemCount, 2);
+  assert.equal(sentMessage.metadata.approvedTotal, 190);
+});
+
+test("单个缺货商品可发送无价格报价单并使用客户语言说明缺货", async (t) => {
+  const { store, session, service } = fixture(t);
+  const chatId = "single-stock-quotation@c.us";
+  store.upsertContact(chatId, { accountId: "primary", providerChatId: chatId, profileName: "缺货客户" });
+  store.addMessage({ id: "single-stock-image", chatId, direction: "inbound", type: "image", body: "这个有货吗？", createdAt: 1000 });
+  const quote = store.createQuote({
+    chatId,
+    inboundMessageId: "single-stock-image",
+    quotationBatchId: "single-stock-batch",
+    quoteType: "priced",
+    basePriceCny: 300,
+    shippingCny: 90,
+    profitRate: 0.75,
+    exchangeRate: 1,
+    suggestedPrice: 615,
+    currency: "USD",
+    customerLanguage: "zh",
+    outOfStock: true,
+    draftReply: "抱歉亲爱的，这款商品目前缺货。"
+  });
+
+  await service.approveQuote(quote.id, {
+    selectedQuoteIds: [quote.id],
+    outOfStock: true,
+    suggestedPrice: 0,
+    exchangeRate: 1,
+    draftReply: "抱歉亲爱的，这款商品目前缺货。"
+  });
+
+  assert.equal(session.sentMedia.length, 1);
+  assert.equal(session.sentMedia[0].media.caption, "抱歉亲爱的，这款商品目前缺货。");
+  const sentQuote = store.getQuote(quote.id);
+  const sentMessage = store.getMessage(chatId, sentQuote.quotationMessageId);
+  assert.equal(sentQuote.outOfStock, true);
+  assert.equal(sentMessage.metadata.approvedTotal, 0);
 });
 
 test("客户视频会保存为可播放媒体并转人工查看", async (t) => {
@@ -1574,6 +1968,54 @@ test("智能体可跨账号复用，复制后可独立编辑并持久化", (t) =
     reopened.close();
   }
   assert.throws(() => store.deleteAgent(sourceAgent.id), /正被/);
+});
+
+test("智能体可连同规则、人物和首次接待媒体导出并重新导入为独立智能体", async (t) => {
+  const { root, store, service } = fixture(t);
+  store.updateAccountStyle("export-account", {
+    status: "ready",
+    progress: 100,
+    progressLabel: "已完成",
+    sampleCount: 42,
+    summary: "Warm, concise and natural.",
+    rules: [{ id: "export-rule", source: "manual", enabled: true, text: "We sell clothing and accessories." }],
+    persona: { gender: "female", business: "Fashion", tone: "warm", personality: "patient and proactive", completed: true }
+  });
+  const sourceAgent = store.getAgent(store.getAccountStyle("export-account").agentId);
+  const image = service.uploadAgentWelcomeMedia(sourceAgent.id, {
+    data: Buffer.from("portable-welcome-image").toString("base64"),
+    mimeType: "image/png",
+    filename: "欢迎目录.png"
+  });
+  store.updateAgent(sourceAgent.id, {
+    welcomeFlow: { enabled: true, steps: [
+      { id: "welcome-copy", type: "text", text: "Hi, dear!" },
+      { id: "welcome-catalog", ...image, caption: "Here is our catalog." }
+    ] }
+  });
+
+  const exported = await service.exportAgentPackage(sourceAgent.id);
+  assert.match(exported.filename, /\.wa-agent$/);
+  const archive = await unzipper.Open.buffer(exported.buffer);
+  assert.equal(archive.files.some((entry) => entry.path === "agent.json"), true);
+  assert.equal(archive.files.some((entry) => entry.path.startsWith("assets/")), true);
+
+  const imported = await service.importAgentPackage(exported.buffer);
+  assert.notEqual(imported.id, sourceAgent.id);
+  assert.equal(imported.name, sourceAgent.name);
+  assert.equal(imported.accountCount, 0);
+  assert.equal(imported.summary, "Warm, concise and natural.");
+  assert.equal(imported.rules[0].text, "We sell clothing and accessories.");
+  assert.equal(imported.persona.business, "Fashion");
+  assert.deepEqual(imported.welcomeFlow.steps.map((step) => step.type), ["text", "image"]);
+  assert.equal(imported.welcomeFlow.steps[1].caption, "Here is our catalog.");
+  const importedImageName = path.basename(decodeURIComponent(imported.welcomeFlow.steps[1].mediaUrl.slice("/media/".length)));
+  assert.equal(fs.readFileSync(path.join(root, "media", importedImageName), "utf8"), "portable-welcome-image");
+});
+
+test("导入会拒绝损坏或不受支持的智能体文件", async (t) => {
+  const { service } = fixture(t);
+  await assert.rejects(() => service.importAgentPackage(Buffer.from("not-a-zip")), /无法读取智能体文件/);
 });
 
 test("WhatsApp account registry and workflow checkpoints are persisted for MySQL", (t) => {

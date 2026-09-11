@@ -1,8 +1,14 @@
 const axios = require("axios");
 
-const QUOTE_CURRENCIES = ["EUR", "USD", "GBP"];
+// Match the currency templates in manos/src/views/ChatOrder.vue.
+const QUOTE_CURRENCIES = ["GBP", "EUR", "USD", "AUD"];
 const SHIPPING_OPTIONS_CNY = [90, 150, 180, 300];
-const FALLBACK_RATES = Object.freeze({ EUR: 0.13, USD: 0.14, GBP: 0.11 });
+const FALLBACK_RATES = Object.freeze({
+  GBP: Number((1 / 9.35).toFixed(6)),
+  EUR: Number((1 / 7.75).toFixed(6)),
+  USD: Number((1 / 7.25).toFixed(6)),
+  AUD: Number((1 / 4.65).toFixed(6))
+});
 
 function number(value, fallback = 0) {
   const parsed = Number(value);
@@ -10,7 +16,7 @@ function number(value, fallback = 0) {
 }
 
 function normalizeProfitRate(value) {
-  return Math.min(0.8, Math.max(0.7, number(value, 0.75)));
+  return Math.max(0, number(value, 0.75));
 }
 
 function calculateFinalQuote({ basePriceCny, shippingCny, profitRate, currency, rates }) {
