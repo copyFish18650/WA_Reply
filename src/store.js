@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
-const { MANOS_LEAD_WELCOME, isSystemConversation } = require("./message-policy");
+const { randomUUID } = require("crypto");
+const { MANOS_LEAD_WELCOME, isSystemConversation, isSystemNotice, isManosMarker } = require("./message-policy");
 const { MysqlStateDatabase } = require("./database");
 const { TestStateDatabase } = require("./test-state-database");
 const { DatabaseRemoteAuthStore } = require("./database-auth-store");
@@ -130,6 +131,9 @@ function defaultAccountStyle(accountId) {
     welcomeFlow: defaultWelcomeFlow(),
     persona: defaultAccountPersona(),
     sampleCount: 0,
+    modelSampleCount: 0,
+    analysisMethod: "",
+    analysisWarning: "",
     progress: 0,
     progressLabel: "等待读取历史语言风格",
     error: "",
@@ -246,6 +250,42 @@ class Store {
         ssl: process.env.MYSQL_SSL === "true" ? {} : undefined
       }), dataDir: this.dataDir }));
     this.state = this.load();
+    this.repairSystemNotices();
+  }
+
+  repairSystemNotices() {
+    const notices = this.state.messages.filter(isSystemNotice);
+    if (!notices.length) return;
+    const noticeKeys = new Set(notices.map(row => `${row.chatId}::${row.id}`));
+    let changed = false;
+    for (const message of notices) {
+      if (message.metadata?.automationSource === "system-notice" && message.metadata?.automationState === "ignored") continue;
+      message.metadata = { ...(message.metadata || {}), automationState: "ignored", automationSource: "system-notice", automationReason: "WhatsApp 系统通知，无需回复" };
+      changed = true;
+    }
+    for (const learned of this.state.learnedReplies) {
+      if (!learned.ignored && noticeKeys.has(`${learned.chatId}::${learned.sourceMessageId}`)) {
+        learned.ignored = true;
+        learned.ignoredReason = "来源是系统通知，不是客户问题";
+        changed = true;
+      }
+    }
+    for (const chatId of new Set(notices.map(row => row.chatId))) {
+      const contact = this.state.contacts[chatId];
+      if (!contact) continue;
+      if (contact.mode !== "human" && contact.needsHuman && noticeKeys.has(`${chatId}::${contact.handoffMessageId}`)
+        && !this.state.quotes.some(quote => quote.chatId === chatId && ["pending", "approved"].includes(quote.status))) {
+        Object.assign(contact, { needsHuman: false, escalationReason: "", handoffMessageId: "" });
+        changed = true;
+      }
+      if (notices.some(row => row.chatId === chatId && row.body === contact.lastMessagePreview)) {
+        const latest = this.getLatestMessage(chatId);
+        contact.lastMessagePreview = latest?.body || "";
+        contact.lastMessageAt = latest?.createdAt || 0;
+        changed = true;
+      }
+    }
+    if (changed) this.save();
   }
 
   load() {
@@ -609,6 +649,59 @@ class Store {
     return row ? { ...row } : null;
   }
 
+  clearAccountConversations(accountId, details = {}) {
+    const id = String(accountId || "").trim();
+    if (!id) throw new Error("accountId 不能为空");
+    const belongsToAccount = (row) => String(row.accountId || "") === id || String(row.chatId || "").startsWith(`${id}::`);
+    const contacts = Object.values(this.state.contacts).filter(belongsToAccount);
+    const chatIds = new Set(contacts.map((row) => row.chatId));
+    for (const row of this.state.messages) if (belongsToAccount(row)) chatIds.add(row.chatId);
+    const belongsToGroup = (row) => belongsToAccount(row) || chatIds.has(row.chatId);
+    const snapshot = {
+      version: 1,
+      accountId: id,
+      archivedAt: Date.now(),
+      reason: String(details.reason || "logout"),
+      previousAccountId: String(details.previousAccountId || ""),
+      nextAccountId: String(details.nextAccountId || ""),
+      contacts,
+      messages: this.state.messages.filter(belongsToGroup),
+      quotes: this.state.quotes.filter(belongsToGroup),
+      learnedReplies: this.state.learnedReplies.filter(belongsToGroup),
+      customerMemories: this.state.customerMemories.filter(belongsToGroup),
+      conversationMemories: Object.fromEntries(Object.entries(this.state.conversationMemories).filter(([chatId]) => chatIds.has(chatId) || chatId.startsWith(`${id}::`))),
+      accountStyle: this.state.accountStyles[id] || null,
+      agentId: this.state.accountAgentBindings[id] || "",
+      automation: this.state.accountAutomation[id] || null
+    };
+    let archivePath = "";
+    if (contacts.length || snapshot.messages.length || snapshot.quotes.length || snapshot.learnedReplies.length || snapshot.customerMemories.length || Object.keys(snapshot.conversationMemories).length || snapshot.accountStyle || snapshot.automation || snapshot.agentId) {
+      const archiveDir = path.join(this.dataDir, "account-archives");
+      fs.mkdirSync(archiveDir, { recursive: true });
+      archivePath = path.join(archiveDir, `${id.replace(/[^a-z0-9_-]/gi, "_").slice(0, 80)}-${snapshot.archivedAt}-${randomUUID()}.json`);
+      // Keep the original records before clearing the active workspace. Never restore them into another login.
+      fs.writeFileSync(archivePath, JSON.stringify(snapshot, null, 2), { encoding: "utf8", flag: "wx" });
+    }
+    const previous = this.state;
+    this.state = {
+      ...previous,
+      contacts: Object.fromEntries(Object.entries(previous.contacts).filter(([, row]) => !belongsToGroup(row))),
+      messages: previous.messages.filter((row) => !belongsToGroup(row)),
+      quotes: previous.quotes.filter((row) => !belongsToGroup(row)),
+      learnedReplies: previous.learnedReplies.filter((row) => !belongsToGroup(row)),
+      customerMemories: previous.customerMemories.filter((row) => !belongsToGroup(row)),
+      conversationMemories: Object.fromEntries(Object.entries(previous.conversationMemories).filter(([chatId]) => !chatIds.has(chatId) && !chatId.startsWith(`${id}::`))),
+      accountStyles: { ...previous.accountStyles },
+      accountAgentBindings: { ...previous.accountAgentBindings },
+      accountAutomation: { ...previous.accountAutomation }
+    };
+    delete this.state.accountStyles[id];
+    delete this.state.accountAgentBindings[id];
+    delete this.state.accountAutomation[id];
+    try { this.save(); } catch (error) { this.state = previous; throw error; }
+    return { accountId: id, chatIds: [...chatIds], contacts: contacts.length, messages: snapshot.messages.length, quotes: snapshot.quotes.length, archivePath };
+  }
+
   listContacts(query = "", filter = "all") {
     const q = String(query || "").trim().toLowerCase();
     const pendingByChat = this.state.quotes.reduce((map, quote) => {
@@ -633,6 +726,7 @@ class Store {
   }
 
   addMessage(message) {
+    if (isSystemNotice(message)) return { inserted: false, ignored: true, message: null };
     const id = String(message.id || `local-${Date.now()}-${Math.random().toString(16).slice(2)}`);
     const chatId = String(message.chatId || "");
     const duplicate = this.state.messages.find((item) => item.id === id && item.chatId === chatId);
@@ -716,7 +810,7 @@ class Store {
 
   getLatestMessage(chatId) {
     const row = this.state.messages
-      .filter((item) => item.chatId === String(chatId))
+      .filter((item) => item.chatId === String(chatId) && !isSystemNotice(item))
       .sort((a, b) => b.createdAt - a.createdAt)[0];
     return row ? { ...row, metadata: { ...(row.metadata || {}) } } : null;
   }
@@ -735,6 +829,7 @@ class Store {
     const answer = String(data.answer || "").trim();
     const accountId = String(data.accountId || "").trim();
     if (!question || !answer || !accountId) return null;
+    if (data.sourceMessageId && isSystemNotice(this.getMessage(data.chatId, data.sourceMessageId) || {})) return null;
     const normalized = question.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
     const duplicate = this.state.learnedReplies.find((item) => item.accountId === accountId && item.normalizedQuestion === normalized);
     const now = Date.now();
@@ -763,7 +858,7 @@ class Store {
   findLearnedReplies(accountId, text, intent = "general", limit = 4) {
     const keywords = contextKeywords(text);
     return this.state.learnedReplies
-      .filter((item) => item.accountId === String(accountId || ""))
+      .filter((item) => item.accountId === String(accountId || "") && !item.ignored)
       .map((item) => {
         const itemKeywords = new Set(item.keywords || contextKeywords(item.question));
         const overlap = keywords.filter((word) => itemKeywords.has(word)).length;
@@ -778,7 +873,7 @@ class Store {
 
   listLearnedReplies(accountId, limit = 20) {
     return this.state.learnedReplies
-      .filter((item) => item.accountId === String(accountId || ""))
+      .filter((item) => item.accountId === String(accountId || "") && !item.ignored)
       .sort((a, b) => b.updatedAt - a.updatedAt)
       .slice(0, Math.min(Math.max(number(limit, 20), 1), 100))
       .map((item) => ({ ...item, keywords: [...(item.keywords || [])] }));
@@ -939,6 +1034,7 @@ class Store {
   hasLaterInbound(chatId, createdAt, messageId = "") {
     return this.state.messages.some((item) => item.chatId === String(chatId)
       && item.direction === "inbound"
+      && !isManosMarker(item) && !isSystemNotice(item)
       && item.id !== String(messageId || "")
       && item.createdAt > number(createdAt));
   }
@@ -948,14 +1044,17 @@ class Store {
     const latestByChat = new Map();
     for (const message of this.state.messages) {
       if (!(message.accountId === id || message.chatId.startsWith(`${id}::`))) continue;
+      if (isSystemNotice(message) || isManosMarker(message)) continue;
       const previous = latestByChat.get(message.chatId);
-      if (!previous || message.createdAt > previous.createdAt) latestByChat.set(message.chatId, message);
+      if (!previous || message.createdAt >= previous.createdAt) latestByChat.set(message.chatId, message);
     }
     return [...latestByChat.values()]
       .filter((message) => message.direction === "inbound"
         && message.createdAt >= number(cutoff)
         && ["text", "image", "video"].includes(message.type)
-        && !message.metadata?.automationState)
+        && (!message.metadata?.automationState || (message.metadata.automationState === "superseded"
+          && message.metadata.automationReason === "已合并到该客户更新的消息中"
+          && this.state.messages.some(item => item.chatId === message.chatId && item.createdAt >= message.createdAt && isManosMarker(item)))))
       .sort((a, b) => a.createdAt - b.createdAt)
       .map((message) => ({ ...message, metadata: { ...(message.metadata || {}) } }));
   }
@@ -992,6 +1091,7 @@ class Store {
     const seen = new Set();
     return this.state.messages
       .filter((item) => item.direction === "outbound"
+        && !isSystemNotice(item)
         && (item.accountId === id || item.chatId.startsWith(`${id}::`))
         && item.body.trim()
         && !/ManosID\s*--/i.test(item.body)
@@ -1196,6 +1296,7 @@ class Store {
     return this.state.messages
       .filter((message) => (message.accountId === id || message.chatId.startsWith(`${id}::`))
         && message.direction === "inbound"
+        && !isSystemNotice(message)
         && message.metadata?.automationState === "queued"
         && !isSystemConversation(this.state.contacts[message.chatId] || message))
       .sort((a, b) => a.createdAt - b.createdAt)
@@ -1206,7 +1307,7 @@ class Store {
     const limit = Math.min(Math.max(number(options.limit, 100), 1), 500);
     const before = number(options.before, Number.MAX_SAFE_INTEGER);
     const rows = this.state.messages
-      .filter((item) => item.chatId === String(chatId) && item.createdAt < before)
+      .filter((item) => item.chatId === String(chatId) && item.createdAt < before && !isSystemNotice(item))
       .sort((a, b) => b.createdAt - a.createdAt)
       .slice(0, limit)
       .reverse();
@@ -1224,7 +1325,7 @@ class Store {
   getContext(chatId, currentText = "") {
     const limit = Math.min(Math.max(number(this.state.settings.contextMessageLimit, 60), 10), 200);
     const all = this.state.messages
-      .filter((item) => item.chatId === String(chatId) && ["text", "image"].includes(item.type))
+      .filter((item) => item.chatId === String(chatId) && ["text", "image"].includes(item.type) && !isManosMarker(item))
       .sort((a, b) => a.createdAt - b.createdAt);
     const recent = all.slice(-limit);
     const recentIds = new Set(recent.map((item) => item.id));
@@ -1446,8 +1547,9 @@ class Store {
     return this.quoteWithLanguage(removed);
   }
 
-  stats() {
-    const contacts = Object.values(this.state.contacts).filter((contact) => !contact.isSystem && !isSystemConversation(contact));
+  stats(accountIds = null) {
+    const allowed = accountIds === null ? null : new Set(accountIds);
+    const contacts = Object.values(this.state.contacts).filter((contact) => (!allowed || allowed.has(contact.accountId)) && !contact.isSystem && !isSystemConversation(contact));
     const contactIds = new Set(contacts.map((contact) => contact.chatId));
     return {
       conversations: contacts.length,

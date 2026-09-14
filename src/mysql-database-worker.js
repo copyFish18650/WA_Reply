@@ -1,5 +1,6 @@
 const { workerData } = require("worker_threads");
 const mysql = require("mysql2/promise");
+const { isNewAccountInstance, mergeAccountRegistryRecord, mergeAccountStatusRecord } = require("./account-registry");
 
 const SCHEMA_VERSION = 1;
 const TABLES = [
@@ -221,17 +222,19 @@ async function listAccounts(executor = pool) {
 }
 
 async function replaceAccounts(accounts) {
-  const normalized = (Array.isArray(accounts) ? accounts : []).map((item) => ({ id: String(item.id || item.accountId || ""), clientId: String(item.clientId || item.id || item.accountId || ""), label: String(item.label || item.id || item.accountId || ""), createdAt: Number(item.createdAt || Date.now()), ...item })).filter((item) => item.id && /^[-_\w]+$/i.test(item.clientId));
+  const normalized = (Array.isArray(accounts) ? accounts : []).filter((item) => item && String(item.id || item.accountId || "") && /^[-_\w]+$/i.test(String(item.clientId || item.id || item.accountId || "")));
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
     const existingRows = await listAccounts(connection);
     const existing = new Map(existingRows.map((item) => [String(item.id || item.accountId), item]));
-    const sql = `INSERT INTO whatsapp_accounts(account_id, client_id, label, wa_id, push_name, platform, last_status, last_connected_at, created_at, updated_at, data_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE client_id=VALUES(client_id), label=VALUES(label), wa_id=VALUES(wa_id), push_name=VALUES(push_name), platform=VALUES(platform), last_status=VALUES(last_status), last_connected_at=VALUES(last_connected_at), updated_at=VALUES(updated_at), data_json=VALUES(data_json)`;
+    const sql = `INSERT INTO whatsapp_accounts(account_id, client_id, label, wa_id, push_name, platform, last_status, last_connected_at, created_at, updated_at, data_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE client_id=VALUES(client_id), label=VALUES(label), wa_id=VALUES(wa_id), push_name=VALUES(push_name), platform=VALUES(platform), last_status=VALUES(last_status), last_connected_at=VALUES(last_connected_at), created_at=VALUES(created_at), updated_at=VALUES(updated_at), data_json=VALUES(data_json)`;
     const keep = new Set();
     for (const incoming of normalized) {
       const accountId = String(incoming.id || incoming.accountId);
-      const merged = { ...(existing.get(accountId) || {}), ...incoming, id: accountId, accountId };
+      const previous = existing.get(accountId);
+      const merged = mergeAccountRegistryRecord(previous, incoming);
+      if (isNewAccountInstance(previous, incoming)) await connection.execute("DELETE FROM whatsapp_sessions WHERE account_id = ?", [accountId]);
       const account = merged.account || {};
       const now = Date.now();
       keep.add(accountId);
@@ -249,9 +252,9 @@ async function updateAccount({ accountId, patch }) {
   const accounts = await listAccounts();
   const current = accounts.find((item) => String(item.id || item.accountId) === id);
   if (!current) return null;
-  const account = patch.account || current.account || {};
   const now = Date.now();
-  const merged = { ...current, ...patch, id, accountId: id, account, updatedAt: now };
+  const merged = mergeAccountStatusRecord(current, patch, now);
+  const account = merged.account || {};
   const lastStatus = String(merged.lastStatus || merged.status || "offline");
   if (lastStatus === "ready" && !merged.lastConnectedAt) merged.lastConnectedAt = now;
   await pool.execute("UPDATE whatsapp_accounts SET label=?, wa_id=?, push_name=?, platform=?, last_status=?, last_connected_at=?, updated_at=?, data_json=? WHERE account_id=?", [String(merged.label || id), String(account.id || merged.waId || ""), String(account.name || merged.pushName || ""), String(account.platform || merged.platform || ""), lastStatus, Number(merged.lastConnectedAt || 0), now, json(merged), id]);

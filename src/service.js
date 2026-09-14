@@ -2,6 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const EventEmitter = require("events");
+const { AsyncLocalStorage } = require("async_hooks");
 const archiver = require("archiver");
 const unzipper = require("unzipper");
 const {
@@ -20,6 +21,7 @@ const {
   MANOS_ALBUM_FOLLOW_UP,
   isSystemConversation,
   isManosLead,
+  isManosMarker,
   isGreeting,
   isAlbumFollowUp
 } = require("./message-policy");
@@ -230,6 +232,7 @@ function conversationKey(accountId, providerChatId) {
 
 function needsChineseTranslation(text) {
   const value = String(text || "").trim();
+  if (isManosMarker(value)) return false;
   if (!value || value.length > 5000 || !/[A-Za-z]{2}/.test(value)) return false;
   if (/^(?:https?:\/\/|www\.)\S+$/i.test(value)) return false;
   const hanCount = (value.match(/[\p{Script=Han}]/gu) || []).length;
@@ -400,8 +403,12 @@ function supplierSizeReply(message, facts) {
 class SalesService extends EventEmitter {
   constructor({ store, session, dataDir }) {
     super();
-    this.store = store;
-    this.session = session;
+    this.accountGenerations = new Map();
+    this.accountWork = new AsyncLocalStorage();
+    // An async model/translation result may arrive after logout. Guard every
+    // service store call so those continuations cannot restore cleared data.
+    this.store = this.guardAccountResource(store);
+    this.session = this.guardAccountResource(session, new Set(["sendText", "sendMedia", "downloadMessageMedia", "syncHistory"]));
     this.dataDir = path.resolve(dataDir);
     this.mediaDir = path.join(this.dataDir, "media");
     fs.mkdirSync(this.mediaDir, { recursive: true });
@@ -409,25 +416,180 @@ class SalesService extends EventEmitter {
     this.supplier = new SupplierSearch(() => this.store.getRuntimeSettings());
     this.queues = new Map();
     this.accountQueueJobs = new Map();
+    this.accountReadiness = new Map();
     this.approvals = new Set();
     this.styleJobs = new Map();
     this.translationJobs = new Map();
     this.memoryJobs = new Map();
     this.memoryTimers = new Map();
+    this.scopeAccountOperations();
+    this.reconcileLegacyAccountConversations();
     this.store.recoverProcessingMessages();
+    this.repairMarkerHandoffs();
     this.bindSession();
   }
 
+  accountChangedError() {
+    return Object.assign(new Error("账号已退出或切换，原账号任务已取消"), { code: "ACCOUNT_CHANGED", statusCode: 409 });
+  }
+
+  assertAccountWork() {
+    const scope = this.accountWork.getStore();
+    if (scope && scope.generation !== (this.accountGenerations.get(scope.accountId) || 0)) throw this.accountChangedError();
+  }
+
+  guardAccountResource(resource, methods = null) {
+    return new Proxy(resource, {
+      get: (target, key) => {
+        const value = Reflect.get(target, key, target);
+        if (typeof value !== "function") return value;
+        return (...args) => {
+          if (!methods || methods.has(key)) this.assertAccountWork();
+          return value.apply(target, args);
+        };
+      }
+    });
+  }
+
+  runForAccount(accountId, task) {
+    this.assertAccountWork();
+    const id = String(accountId || "primary");
+    const existing = this.accountWork.getStore();
+    if (existing?.accountId === id) return task();
+    return this.accountWork.run({ accountId: id, generation: this.accountGenerations.get(id) || 0 }, task);
+  }
+
+  accountForConversation(chatId) {
+    const id = String(chatId || "");
+    return this.store.getContact(id)?.accountId || (id.includes("::") ? id.split("::")[0] : "primary");
+  }
+
+  scopeAccountOperations() {
+    const byAccount = ["runAccountQueue", "readAccountRecords", "analyzeAccountStyle", "ensureAccountStyle", "catchUpRecentInbound"];
+    const byChat = ["enqueue", "organizeConversationMemory", "startConversationMemoryOrganization", "scheduleConversationMemory", "recoverMessageMedia", "replyToMessage", "translateMessages", "sendText", "sendWelcomeMedia", "sendManualReply", "sendManualMedia", "sendManualMediaBatch"];
+    const byMessage = ["ingest", "processAndRecord", "process", "processImage", "replyFromSupplierFacts", "sendWelcomeFlow"];
+    const byQuoteId = ["retryQuoteSearch", "translateQuote", "prepareQuoteDocument", "approveQuote", "rejectQuote"];
+    const resolvers = new Map([
+      ...byAccount.map(name => [name, args => args[0]]),
+      ...byChat.map(name => [name, args => this.accountForConversation(args[0])]),
+      ...byMessage.map(name => [name, args => args[0]?.accountId || this.accountForConversation(args[0]?.chatId)]),
+      ...byQuoteId.map(name => [name, args => this.accountForConversation(this.store.getQuote(args[0])?.chatId)]),
+      ["sendQuoteDocument", args => this.accountForConversation(args[0]?.chatId)],
+      ["acknowledgeQuotePreparation", args => this.accountForConversation(args[0]?.chatId)],
+      ["translateText", args => args[2] ? this.accountForConversation(args[2]) : ""]
+    ]);
+    for (const [name, resolve] of resolvers) {
+      const operation = this[name];
+      const invoke = args => {
+        this.assertAccountWork();
+        const accountId = resolve(args);
+        return accountId ? this.runForAccount(accountId, () => operation.apply(this, args)) : operation.apply(this, args);
+      };
+      // Preserve rejected-Promise behavior of public async methods.
+      this[name] = operation.constructor.name === "AsyncFunction" ? (...args) => {
+        try { return invoke(args); } catch (error) { return Promise.reject(error); }
+      } : (...args) => invoke(args);
+    }
+  }
+
+  activeAccountIds() {
+    const accounts = this.session.getStatus().accounts || [];
+    if (!Array.isArray(this.session.registry)) return accounts.map(account => String(account.accountId));
+    return accounts.filter(account => {
+      const meta = this.session.registry.find(item => item.id === account.accountId);
+      return meta && (account.account || meta.account || meta.lastAccount || ["ready", "syncing"].includes(account.status));
+    }).map(account => String(account.accountId));
+  }
+
+  listConversations(query = "", filter = "all", accountId = "") {
+    const selected = String(accountId || "");
+    const active = new Set(this.activeAccountIds());
+    if (["demo", "dev"].includes(selected)) active.add(selected);
+    return this.store.listContacts(query, filter).filter(contact => active.has(String(contact.accountId || "primary")) && (!selected || contact.accountId === selected));
+  }
+
+  isConversationAvailable(chatId) {
+    const contact = this.store.getContact(chatId);
+    return Boolean(contact && (["demo", "dev"].includes(contact.accountId) || this.activeAccountIds().includes(String(contact.accountId || "primary"))));
+  }
+
+  clearAccountConversations(event = {}) {
+    const accountId = String(event.accountId || "");
+    if (!accountId) return null;
+    // Archive/delete synchronously before invalidating running continuations.
+    // A failed archive aborts the session change without losing its records.
+    const cleared = this.store.clearAccountConversations(accountId, event);
+    this.accountGenerations.set(accountId, (this.accountGenerations.get(accountId) || 0) + 1);
+    const chats = new Set(cleared.chatIds);
+    for (const chatId of [...this.memoryTimers.keys(), ...this.memoryJobs.keys(), ...this.queues.keys()]) {
+      if (chatId.startsWith(`${accountId}::`)) chats.add(chatId);
+    }
+    for (const chatId of chats) {
+      clearTimeout(this.memoryTimers.get(chatId));
+      this.memoryTimers.delete(chatId);
+      this.memoryJobs.delete(chatId);
+      this.queues.delete(chatId);
+    }
+    for (const key of this.translationJobs.keys()) {
+      if ([...chats].some(chatId => key.startsWith(`${chatId}::`))) this.translationJobs.delete(key);
+    }
+    this.accountQueueJobs.delete(accountId);
+    this.accountReadiness.delete(accountId);
+    this.styleJobs.delete(accountId);
+    this.publish("account-cleared", { ...event, ...cleared });
+    return cleared;
+  }
+
+  reconcileLegacyAccountConversations() {
+    if (!Array.isArray(this.session.registry)) return;
+    const groups = new Map();
+    for (const contact of this.store.listContacts()) {
+      const id = String(contact.accountId || "primary");
+      if (["demo", "dev"].includes(id)) continue;
+      if (!groups.has(id)) groups.set(id, []);
+      groups.get(id).push(contact);
+    }
+    for (const [accountId, contacts] of groups) {
+      const meta = this.session.registry.find(item => item.id === accountId);
+      const inheritedOldIdentity = meta && Number(meta.lastConnectedAt) > 0 && Number(meta.lastConnectedAt) < Number(meta.createdAt);
+      const recreatedEmptySlot = meta && ((!meta.account && !meta.lastAccount) || inheritedOldIdentity) && Number(meta.createdAt) > 0
+        && contacts.every(contact => Number(contact.createdAt) > 0 && Number(contact.createdAt) < Number(meta.createdAt));
+      if (!meta || recreatedEmptySlot) this.clearAccountConversations({ accountId, reason: "legacy-logout", previousAccountId: meta?.lastAccount?.id || meta?.account?.id || "" });
+    }
+  }
+
+  repairMarkerHandoffs() {
+    let repaired = 0;
+    for (const contact of this.store.listContacts()) {
+      if (contact.mode === "human" || !contact.needsHuman || !/本地 (?:AI|模型).*(?:timeout|超时)/i.test(contact.escalationReason || "")) continue;
+      const message = this.store.getMessage(contact.chatId, contact.handoffMessageId);
+      if (!message || !isManosMarker(message)) continue;
+      if (this.store.listQuotes("all", contact.chatId).some(quote => ["pending", "approved"].includes(quote.status))) continue;
+      this.updateAutomation(message, "ignored", { automationSource: "lead-marker", automationReason: "广告来源标记不需要生成回复，已清理误触发的超时状态" });
+      this.store.resolveHuman(contact.chatId);
+      repaired += 1;
+    }
+    return repaired;
+  }
+
   publish(type, payload = {}) {
+    try { this.assertAccountWork(); } catch (_) { return; }
     this.emit("update", { type, timestamp: Date.now(), ...payload });
   }
 
   bindSession() {
+    this.session.on("account-cleared", event => this.accountWork.run(undefined, () => this.clearAccountConversations(event)));
     this.session.on("status", (status) => {
       this.publish("session", { status });
       for (const account of status.accounts || []) {
-        if (account.status === "ready" && this.store.getAccountAutomation(account.accountId).enabled) {
-          this.runAccountQueue(account.accountId).catch((error) => this.publish("error", { accountId: account.accountId, message: error.message }));
+        const connected = this.accountIsReady(account.accountId);
+        const wasConnected = this.accountReadiness.get(account.accountId) || false;
+        this.accountReadiness.set(account.accountId, connected);
+        if (connected && this.store.getAccountAutomation(account.accountId).enabled) {
+          const work = wasConnected ? this.runAccountQueue(account.accountId) : this.catchUpRecentInbound(account.accountId);
+          work.catch((error) => {
+            if (error.code !== "ACCOUNT_CHANGED") this.publish("error", { accountId: account.accountId, message: error.message });
+          });
         }
       }
     });
@@ -455,20 +617,31 @@ class SalesService extends EventEmitter {
       });
       const inserted = this.store.importHistory(conversationId, profileName, normalized, unread);
       if (inserted) this.publish("history", { chatId: conversationId, accountId, inserted });
+      if (inserted && this.store.getAccountAutomation(accountId).enabled) {
+        this.catchUpRecentInbound(accountId, conversationId).catch((error) => {
+          if (error.code !== "ACCOUNT_CHANGED") this.publish("error", { accountId, message: `同步新消息续回失败：${error.message}` });
+        });
+      }
     });
     this.session.on("history-complete", ({ accountId }) => {
       this.ensureAccountStyle(accountId)
-        .then(() => this.store.getAccountAutomation(accountId).enabled ? this.catchUpRecentInbound(accountId) : null)
-        .catch((error) => this.publish("error", { accountId, message: `历史断点续回失败：${error.message}` }));
+        .catch((error) => this.publish("error", { accountId, message: `账号风格学习失败：${error.message}` }));
+      if (this.store.getAccountAutomation(accountId).enabled) {
+        this.catchUpRecentInbound(accountId).catch((error) => {
+          if (error.code !== "ACCOUNT_CHANGED") this.publish("error", { accountId, message: `历史断点续回失败：${error.message}` });
+        });
+      }
     });
     this.session.on("message", (message) => {
       this.ingest(message).catch((error) => {
+        if (error.code === "ACCOUNT_CHANGED") return;
         const chatId = conversationKey(message.accountId, message.chatId);
         this.store.requestHuman(chatId, `自动处理失败：${error.message}`, message.id);
         this.publish("error", { chatId, accountId: message.accountId, message: error.message });
       });
     });
     this.session.on("outbound", (message) => {
+      if (isSystemConversation(message)) return;
       const providerChatId = message.chatId;
       const conversationId = conversationKey(message.accountId, providerChatId);
       this.store.upsertContact(conversationId, {
@@ -511,7 +684,8 @@ class SalesService extends EventEmitter {
   }
 
   accountIsReady(accountId) {
-    return (this.session.getStatus().accounts || []).some((account) => account.accountId === String(accountId) && account.status === "ready");
+    return (this.session.getStatus().accounts || []).some((account) => account.accountId === String(accountId)
+      && (account.status === "ready" || (account.status === "syncing" && Boolean(account.account?.id))));
   }
 
   queueSnapshot(accountId) {
@@ -559,6 +733,7 @@ class SalesService extends EventEmitter {
   }
 
   queueMessage(message, reason = "等待账号 AI 开关开启") {
+    if (isManosMarker(message)) return this.updateAutomation(message, "ignored", { automationSource: "lead-marker", automationReason: "广告来源标记已保留，等待客户实际问题" });
     const updated = this.updateAutomation(message, "queued", {
       automationReason: reason,
       automationSource: "account-queue",
@@ -569,7 +744,9 @@ class SalesService extends EventEmitter {
   }
 
   prepareNextQueuedMessage(accountId) {
-    const raw = this.store.listQueuedMessages(accountId);
+    const queued = this.store.listQueuedMessages(accountId);
+    for (const message of queued) if (isManosMarker(message)) this.queueMessage(message);
+    const raw = queued.filter(message => !isManosMarker(message));
     const latestTextByChat = new Map();
     const candidates = [];
     for (const message of raw) {
@@ -578,7 +755,7 @@ class SalesService extends EventEmitter {
         continue;
       }
       const later = latestTextByChat.get(message.chatId);
-      if (!later || message.createdAt > later.createdAt) latestTextByChat.set(message.chatId, message);
+      if (!later || message.createdAt >= later.createdAt) latestTextByChat.set(message.chatId, message);
     }
     for (const message of raw) {
       if (message.type !== "text") continue;
@@ -604,6 +781,7 @@ class SalesService extends EventEmitter {
   async runAccountQueue(accountId) {
     const id = String(accountId || "");
     if (this.accountQueueJobs.has(id)) return this.accountQueueJobs.get(id);
+    let completedNormally = false;
     const job = (async () => {
       let automation = this.store.getAccountAutomation(id);
       if (!automation.enabled) return this.queueSnapshot(id);
@@ -614,6 +792,7 @@ class SalesService extends EventEmitter {
       this.store.updateAccountAutomation(id, { status: "preparing", current: null, lastError: "" });
       this.publishAccountQueue(id);
       while (this.store.getAccountAutomation(id).enabled) {
+        if (!this.accountIsReady(id)) break;
         const message = this.prepareNextQueuedMessage(id);
         if (!message) break;
         const contact = this.store.getContact(message.chatId);
@@ -633,14 +812,36 @@ class SalesService extends EventEmitter {
           await this.enqueue(message.chatId, () => this.processAndRecord(message, null, mediaError, { accountQueue: true }));
           this.store.updateAccountAutomation(id, { lastProcessedAt: Date.now(), lastContactName: current.contactName, lastError: "" });
         } catch (error) {
+          if (!this.accountIsReady(id)) {
+            this.queueMessage(message, "连接已断开，恢复后自动继续");
+            break;
+          }
           this.store.updateAccountAutomation(id, { lastError: error.message });
           this.publish("error", { accountId: id, chatId: message.chatId, message: `队列回复失败：${error.message}` });
         }
       }
       automation = this.store.getAccountAutomation(id);
-      this.store.updateAccountAutomation(id, { status: automation.enabled ? "idle" : "off", current: null });
+      const connected = this.accountIsReady(id);
+      this.store.updateAccountAutomation(id, { status: automation.enabled ? (connected ? "idle" : "waiting_connection") : "off", current: null, ...(!connected && automation.enabled ? { lastError: "连接已断开，恢复后自动继续" } : {}) });
       return this.publishAccountQueue(id);
-    })().finally(() => this.accountQueueJobs.delete(id));
+    })().then((result) => {
+      completedNormally = true;
+      return result;
+    }).finally(() => {
+      if (this.accountQueueJobs.get(id) !== job) return;
+      this.accountQueueJobs.delete(id);
+      try {
+        this.assertAccountWork();
+        // A message can arrive during the final queue-status event, before this job is removed.
+        if (completedNormally && this.store.getAccountAutomation(id).enabled && this.accountIsReady(id) && this.store.listQueuedMessages(id).length) {
+          queueMicrotask(() => this.runAccountQueue(id).catch(error => {
+            if (error.code !== "ACCOUNT_CHANGED") this.publish("error", { accountId: id, message: error.message });
+          }));
+        }
+      } catch (error) {
+        if (error.code !== "ACCOUNT_CHANGED") this.publish("error", { accountId: id, message: error.message });
+      }
+    });
     this.accountQueueJobs.set(id, job);
     return job;
   }
@@ -657,7 +858,9 @@ class SalesService extends EventEmitter {
       ...(enabled ? { lastError: "" } : {})
     });
     this.publishAccountQueue(id);
-    if (next.enabled) this.runAccountQueue(id).catch((error) => this.publish("error", { accountId: id, message: error.message }));
+    if (next.enabled) this.catchUpRecentInbound(id).catch((error) => {
+      if (error.code !== "ACCOUNT_CHANGED") this.publish("error", { accountId: id, message: error.message });
+    });
     return this.queueSnapshot(id);
   }
 
@@ -683,7 +886,7 @@ class SalesService extends EventEmitter {
     const current = this.store.getAccountStyle(id);
     if (!options.force && current.status === "ready" && current.summary) return current;
     const job = (async () => {
-      this.styleProgress(id, { status: "analyzing", progress: 8, progressLabel: "正在整理该账号的历史回复…", error: "" });
+      this.styleProgress(id, { status: "analyzing", progress: 8, progressLabel: "正在整理该账号的历史回复…", error: "", analysisWarning: "" });
       const samples = this.store.listAccountOutbound(id, 300);
       this.styleProgress(id, { status: "analyzing", progress: 32, progressLabel: `已提取 ${samples.length} 条历史回复，正在分析表达习惯…`, sampleCount: samples.length });
       if (!samples.length) {
@@ -692,28 +895,39 @@ class SalesService extends EventEmitter {
           progress: 100,
           progressLabel: "没有读取到该账号发出的历史消息，请手动填写风格描述",
           summary: current.summary || "",
-          sampleCount: 0
+          sampleCount: 0,
+          modelSampleCount: 0,
+          analysisMethod: ""
         });
       }
-      this.styleProgress(id, { status: "analyzing", progress: 58, progressLabel: "本地模型正在总结语言、语气和销售节奏…" });
+      this.styleProgress(id, { status: "analyzing", progress: 58, progressLabel: "正在统计整批样本并分析代表性回复，CPU 模式可能需要数分钟…" });
       const analyzed = await this.ai.analyzeStyle(samples);
       this.styleProgress(id, { status: "analyzing", progress: 88, progressLabel: "正在生成可编辑的风格规则…" });
       const preservedManualRules = (this.store.getAccountStyle(id).rules || []).filter((rule) => rule.source === "manual");
       const analysisRules = analyzed.rules.map((text, index) => ({ id: `analysis-${Date.now()}-${index}`, text, enabled: true, source: "analysis" }));
+      const statistical = analyzed.fallback || analyzed.analysisMethod === "statistics";
+      const modelSampleCount = statistical ? 0 : Number(analyzed.modelSampleCount ?? analyzed.sampleCount);
       return this.styleProgress(id, {
         status: "ready",
         progress: 100,
-        progressLabel: `已基于 ${analyzed.sampleCount} 条历史回复完成分析`,
+        progressLabel: statistical
+          ? `已基于 ${analyzed.sampleCount} 条历史回复统计生成基础风格（模型分析未完成）`
+          : `已统计 ${analyzed.sampleCount} 条历史回复，并由模型分析 ${modelSampleCount} 条代表性摘录`,
         summary: analyzed.summary,
-        rules: [...analysisRules, ...preservedManualRules],
+        rules: [...preservedManualRules, ...analysisRules],
         sampleCount: analyzed.sampleCount,
+        modelSampleCount,
+        analysisMethod: statistical ? "statistics" : "model",
+        analysisWarning: analyzed.warning || "",
         error: "",
         analyzedAt: Date.now()
       });
     })().catch((error) => {
-      this.styleProgress(id, { status: "error", progress: 100, progressLabel: "语言风格分析失败", error: error.message });
+      this.styleProgress(id, { status: "error", progress: 0, progressLabel: "语言风格分析失败", error: error.message });
       throw error;
-    }).finally(() => this.styleJobs.delete(id));
+    }).finally(() => {
+      if (this.styleJobs.get(id) === job) this.styleJobs.delete(id);
+    });
     this.styleJobs.set(id, job);
     return job;
   }
@@ -734,6 +948,8 @@ class SalesService extends EventEmitter {
       status: summary ? "ready" : "needs_input",
       progress: 100,
       progressLabel: summary ? "人工编辑的语言风格已生效" : "请填写语言风格描述",
+      analysisMethod: "manual",
+      analysisWarning: "",
       error: "",
       editedAt: Date.now()
     });
@@ -1127,7 +1343,9 @@ class SalesService extends EventEmitter {
     if (this.memoryJobs.has(chatId)) return { started: false, memorySummary: this.store.getConversationMemory(chatId) };
     const job = this.organizeConversationMemory(chatId, options)
       .catch((error) => this.publish("error", { chatId, message: `长期记忆整理失败：${error.message}` }))
-      .finally(() => this.memoryJobs.delete(chatId));
+      .finally(() => {
+        if (this.memoryJobs.get(chatId) === job) this.memoryJobs.delete(chatId);
+      });
     this.memoryJobs.set(chatId, job);
     return { started: true, memorySummary: this.store.getConversationMemory(chatId) };
   }
@@ -1174,7 +1392,7 @@ class SalesService extends EventEmitter {
       phone: providerChatId.replace(/@.+$/, "")
     });
     const result = this.store.addMessage({ ...message, chatId: conversationId, providerChatId, direction: "inbound", status: "received" });
-    if (!result.inserted) return result;
+    if (!result.inserted && (!result.message || result.message.metadata?.automationState)) return result;
     this.publish("message", { chatId: conversationId, accountId: message.accountId, message: result.message });
     let queuedMessage = result.message;
     if (["image", "video"].includes(message.type) && message.media?.data) queuedMessage = this.cacheInboundMedia(queuedMessage, message.media);
@@ -1191,6 +1409,7 @@ class SalesService extends EventEmitter {
   }
 
   persistMedia(message, media) {
+    this.assertAccountWork();
     const mimeType = media?.mimeType || message.mimeType || (message.type === "video" ? "video/mp4" : "image/jpeg");
     const filename = `${String(message.id).replace(/[^a-zA-Z0-9_-]/g, "_")}${extension(mimeType)}`;
     const localMediaPath = path.join(this.mediaDir, filename);
@@ -1290,6 +1509,9 @@ class SalesService extends EventEmitter {
             : "共享货源没有可用价格，已建立询厂任务；为避免错序未越过后续客户消息发送话术"
           : "图片报价已进入待审核"
       };
+    }
+    if (isManosMarker(message)) {
+      return { state: "ignored", source: "lead-marker", reason: "广告来源标记已保留，等待客户实际问题" };
     }
     const criticalTrigger = HUMAN_TRIGGERS.find((item) => item.alwaysHuman && item.pattern.test(message.body));
     if (criticalTrigger) {
@@ -1427,9 +1649,12 @@ class SalesService extends EventEmitter {
       ]);
       decision = await this.ai.decide(contact, [...this.memoryContextForAI(message.chatId, 16), ...learnedContext, ...context], accountStyle);
     } catch (error) {
-      this.store.requestHuman(message.chatId, `本地 AI 不可用：${error.message}`, message.id);
-      this.publish("handoff", { chatId: message.chatId, reason: `本地 AI 不可用：${error.message}` });
-      return { state: "handoff", reason: `本地 AI 不可用：${error.message}` };
+      const reason = ["ECONNABORTED", "ETIMEDOUT"].includes(error.code)
+        ? "本地模型生成回复超时，请人工处理这条消息或稍后重试"
+        : `本地 AI 不可用：${error.message}`;
+      this.store.requestHuman(message.chatId, reason, message.id);
+      this.publish("handoff", { chatId: message.chatId, reason });
+      return { state: "handoff", reason };
     }
     if (decision.action !== "reply" || decision.confidence < 0.65 || !decision.reply) {
       const reason = decision.reason || "AI 置信度不足";
@@ -1454,18 +1679,18 @@ class SalesService extends EventEmitter {
     return { state: "replied", source: "ai", reason: decision.reason || "本地 AI 已回复" };
   }
 
-  async catchUpRecentInbound(accountId) {
+  async catchUpRecentInbound(accountId, chatId = "") {
     if (!this.store.getAccountAutomation(accountId).enabled) return { accountId, count: 0, paused: true };
     const minutes = Math.min(Math.max(Number(this.store.getRuntimeSettings().catchUpWindowMinutes) || 180, 5), 1440);
     const candidates = this.store.listCatchUpCandidates(accountId, Date.now() - minutes * 60000)
       .filter((message) => {
         const contact = this.store.getContact(message.chatId);
-        return contact && !contact.isSystem && !isSystemConversation(contact) && contact.mode === "auto";
+        return (!chatId || message.chatId === chatId) && contact && !contact.isSystem && !isSystemConversation(contact) && contact.mode === "auto";
       });
     for (const message of candidates) {
       this.queueMessage(message, "断线期间的新消息已加入账号队列");
     }
-    if (candidates.length) await this.runAccountQueue(accountId);
+    await this.runAccountQueue(accountId);
     if (candidates.length) this.publish("catch-up", { accountId, count: candidates.length });
     return { accountId, count: candidates.length };
   }
@@ -1743,7 +1968,7 @@ class SalesService extends EventEmitter {
       const key = `${chatId}::${message.id}`;
       let job = this.translationJobs.get(key);
       if (!job) {
-        job = this.ai.translate(translatableMessageText(message), "zh-CN")
+        job = this.ai.translate(translatableMessageText(message), "zh-CN", { background: true })
           .then((translation) => {
             if (!translation) return null;
             const updated = this.store.updateMessage(message.id, {
@@ -1758,7 +1983,9 @@ class SalesService extends EventEmitter {
             if (updated) this.publish("translation", { chatId, messageId: message.id });
             return updated;
           })
-          .finally(() => this.translationJobs.delete(key));
+          .finally(() => {
+            if (this.translationJobs.get(key) === job) this.translationJobs.delete(key);
+          });
         this.translationJobs.set(key, job);
       }
       const updated = await job;
@@ -2429,9 +2656,10 @@ class SalesService extends EventEmitter {
 
   async status() {
     const session = this.session.getStatus();
+    const activeIds = this.activeAccountIds();
     session.accounts = (session.accounts || []).map((account) => {
       const name = account.account?.name || account.label || account.accountId;
-      this.store.ensureAccountAgent(account.accountId, `${name} 智能体`);
+      if (activeIds.includes(account.accountId) && (account.account || ["ready", "syncing"].includes(account.status))) this.store.ensureAccountAgent(account.accountId, `${name} 智能体`);
       return {
         ...account,
         style: this.store.getAccountStyle(account.accountId),
@@ -2444,7 +2672,7 @@ class SalesService extends EventEmitter {
       database: this.store.getDatabaseStatus(),
       agents: this.store.listAgents(),
       supplierConfigured: Boolean(process.env.SUPPLIER_IMAGE_SEARCH_URL || this.store.getRuntimeSettings().supplierSearchUrl),
-      stats: this.store.stats()
+      stats: this.store.stats(this.activeAccountIds())
     };
   }
 

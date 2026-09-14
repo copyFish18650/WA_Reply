@@ -9,6 +9,9 @@ const sharp = require("sharp");
 const { Store, contextKeywords } = require("../src/store");
 const { SalesService, conversationKey, needsChineseTranslation, detectLanguage } = require("../src/service");
 const {
+  LocalAI,
+  compactStyleSamples,
+  guardStyleRules,
   enforceGrounding,
   fallbackStyleAnalysis,
   compactDecisionHistory,
@@ -22,6 +25,7 @@ const unzipper = require("unzipper");
 const { SupplierSearch, aggregateProductFacts } = require("../src/supplier");
 const { calculateFinalQuote } = require("../src/pricing");
 const { MANOS_LEAD_WELCOME, isGreeting } = require("../src/message-policy");
+const { InferenceQueue } = require("../src/inference-queue");
 
 class FakeSession extends EventEmitter {
   constructor() {
@@ -1110,6 +1114,215 @@ test("临时出站消息收到真实事件后对账而不重复显示", (t) => {
   assert.equal(messages[0].metadata.provisional, false);
 });
 
+test("风格学习限制输入长度并保留不同时间的代表性样本", () => {
+  const history = Array.from({ length: 300 }, (_, index) => ({ body: `sample-${index} ${"Some history. ".repeat(100)}` }));
+  const compact = compactStyleSamples(history);
+  assert.equal(compact.rows.length, 300);
+  assert.equal(compact.modelSampleCount, 24);
+  assert.ok(compact.samples.length <= 2400);
+  assert.match(compact.samples, /sample-0 /);
+  assert.match(compact.samples, /sample-299 /);
+  assert.equal(compactStyleSamples([{ body: " " }, null]).modelSampleCount, 0);
+});
+
+test("客户回复抢先处理，后台推理取消后只完成一次", async () => {
+  const queue = new InferenceQueue();
+  const events = [];
+  let attempts = 0;
+  let markStarted;
+  const started = new Promise(resolve => { markStarted = resolve; });
+  const memory = queue.run(signal => {
+    attempts += 1;
+    if (attempts === 1) return new Promise((resolve, reject) => {
+      signal.addEventListener("abort", () => reject(Object.assign(new Error("cancelled"), { code: "ERR_CANCELED" })), { once: true });
+      markStarted();
+    });
+    events.push("memory");
+    return "saved-memory";
+  }, "memory");
+  await started;
+  const translation = queue.run(() => { events.push("translation"); return "translated"; }, "background");
+  const reply = queue.run(() => { events.push("reply"); return "answer"; }, "reply");
+  assert.deepEqual(await Promise.all([memory, translation, reply]), ["saved-memory", "translated", "answer"]);
+  assert.deepEqual(events, ["reply", "translation", "memory"]);
+  assert.equal(attempts, 2);
+  await new Promise(setImmediate);
+  assert.deepEqual(queue.status(), { busy: false, active: null, queued: 0 });
+});
+
+test("排队期间不发起HTTP请求，前一项失败后后续推理继续", async (t) => {
+  const ai = new LocalAI(() => ({}));
+  const calls = [];
+  let rejectFirst;
+  let firstStarted;
+  const started = new Promise(resolve => { firstStarted = resolve; });
+  t.mock.method(require("axios"), "post", (url, body, options) => {
+    calls.push({ body, options });
+    if (calls.length === 1) return new Promise((resolve, reject) => { rejectFirst = reject; firstStarted(); });
+    return Promise.resolve({ data: { ok: true } });
+  });
+  const first = ai.infer("http://127.0.0.1:19876/v1/chat/completions", { id: 1 });
+  const failure = assert.rejects(first, /failed first/);
+  await started;
+  const second = ai.infer("http://127.0.0.1:19876/api/chat", { id: 2 });
+  await new Promise(setImmediate);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.timeout, 300000);
+  assert.equal(calls[0].options.signal.aborted, false);
+  rejectFirst(new Error("failed first"));
+  await failure;
+  assert.deepEqual((await second).data, { ok: true });
+  assert.equal(calls.length, 2);
+});
+
+test("纯ManosID标记不会触发模型、自动发送或后台翻译", async (t) => {
+  const { store, service, session } = fixture(t);
+  service.ai.decide = async () => { throw new Error("should not infer a marker"); };
+  service.ai.translate = async () => { throw new Error("should not translate a marker"); };
+  await service.ingest({ id: "marker-only", accountId: "primary", chatId: "marker@c.us", profileName: "客户", type: "text", body: 'ManosID--"DBJGZJMN"', createdAt: Date.now() });
+  const chatId = conversationKey("primary", "marker@c.us");
+  const row = store.getMessage(chatId, "marker-only");
+  assert.equal(row.metadata.automationState, "ignored");
+  assert.equal(row.metadata.automationSource, "lead-marker");
+  assert.equal(session.sent.length, 0);
+  assert.equal(store.getContact(chatId).needsHuman, false);
+  assert.equal(needsChineseTranslation(row.body), false);
+  assert.deepEqual(await service.translateMessages(chatId), []);
+  const { isManosMarker } = require("../src/message-policy");
+  assert.equal(isManosMarker('ManosID--"DBJGZJMN" What is the price?'), false);
+});
+
+test("重复历史同步共享同一任务，断线后停止继续抓取其他会话", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wa-sync-reliability-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const session = new AccountSession({ accountId: "primary", clientId: "primary", authDir: root, getSettings: () => ({ historySyncLimit: 0 }) });
+  session.client = {};
+  session.getChatSummaries = async () => [{ chatId: "one@c.us" }, { chatId: "two@c.us" }];
+  let release;
+  let markStarted;
+  const started = new Promise(resolve => { markStarted = resolve; });
+  let fetches = 0;
+  let completed = 0;
+  session.on("history-complete", () => { completed += 1; });
+  session.fetchMessagesForChat = async () => {
+    fetches += 1;
+    if (fetches === 1) await new Promise(resolve => { release = resolve; markStarted(); });
+    return [];
+  };
+  const first = session.syncHistory();
+  await started;
+  const second = session.syncHistory();
+  release();
+  await Promise.all([first, second]);
+  assert.equal(fetches, 2);
+  assert.equal(completed, 1);
+  fetches = 0;
+  session.fetchMessagesForChat = async () => { fetches += 1; session.client = null; throw new Error("disconnected"); };
+  await assert.rejects(session.syncHistory(), /disconnected/);
+  assert.equal(fetches, 1);
+  assert.equal(completed, 1);
+  assert.equal(session.historySyncJob, null);
+});
+
+test("只清理广告标记造成的旧超时，不清理人工接管或真实客户问题", (t) => {
+  const { store, service, session } = fixture(t);
+  const marker = 'ManosID--"DBJGZJMN"';
+  for (const [name, body, manual] of [["marker", marker, false], ["question", "Can you show me a photo?", false], ["manual", marker, true]]) {
+    const chatId = conversationKey("primary", `${name}@c.us`);
+    store.upsertContact(chatId, { accountId: "primary", providerChatId: `${name}@c.us` });
+    store.addMessage({ id: name, chatId, accountId: "primary", direction: "inbound", type: "text", body, createdAt: Date.now() });
+    store.requestHuman(chatId, "本地 AI 不可用：timeout of 90000ms exceeded", name);
+    if (manual) store.upsertContact(chatId, { mode: "human" });
+  }
+  assert.equal(service.repairMarkerHandoffs(), 1);
+  assert.equal(store.getContact(conversationKey("primary", "marker@c.us")).needsHuman, false);
+  assert.equal(store.getContact(conversationKey("primary", "question@c.us")).needsHuman, true);
+  assert.equal(store.getContact(conversationKey("primary", "manual@c.us")).needsHuman, true);
+  assert.equal(session.sent.length, 0);
+});
+
+test("历史风格不能把常用英文或报价样本变成回复禁令", () => {
+  const rules = guardStyleRules([
+    "统一使用英文进行回复", "避免透露具体价格与库存细节", "多用简短问句确认需求"
+  ]);
+  assert.match(rules[0], /客户当前使用的语言/);
+  assert.ok(rules.includes("多用简短问句确认需求"));
+  assert.equal(rules.some(rule => /统一使用英文|避免透露/.test(rule)), false);
+  assert.match(rules.at(-1), /人工确认/);
+});
+
+test("风格学习超时生成明确标注的基础风格并保留人工规则", async (t) => {
+  const { store, service } = fixture(t);
+  const chatId = conversationKey("primary", "style-buyer@c.us");
+  store.importHistory(chatId, "测试客户", [
+    { id: "style-history-1", accountId: "primary", direction: "outbound", body: "Hello dear, how can I help?", createdAt: 1 },
+    { id: "style-history-2", accountId: "primary", direction: "outbound", body: "Please send a photo, dear.", createdAt: 2 }
+  ]);
+  store.updateAccountStyle("primary", { rules: [{ id: "manual", text: "不要承诺未经确认的库存", source: "manual", enabled: true }] });
+  t.mock.method(require("axios"), "post", async () => {
+    throw Object.assign(new Error("timeout"), { code: "ECONNABORTED" });
+  });
+  const style = await service.analyzeAccountStyle("primary", { force: true });
+  assert.equal(style.status, "ready");
+  assert.equal(style.analysisMethod, "statistics");
+  assert.equal(style.sampleCount, 2);
+  assert.equal(style.modelSampleCount, 0);
+  assert.match(style.summary, /英文/);
+  assert.match(style.analysisWarning, /超时/);
+  assert.match(style.progressLabel, /模型分析未完成/);
+  assert.ok(style.rules.some(rule => rule.id === "manual" && rule.source === "manual"));
+  assert.equal(store.getAccountStyle("primary").analysisMethod, "statistics");
+  assert.equal(service.styleJobs.size, 0);
+});
+
+test("两种模型的风格学习使用独立等待时间和受限输出", async (t) => {
+  const priorTimeout = process.env.LOCAL_AI_STYLE_TIMEOUT_MS;
+  process.env.LOCAL_AI_STYLE_TIMEOUT_MS = "900000";
+  t.after(() => {
+    if (priorTimeout === undefined) delete process.env.LOCAL_AI_STYLE_TIMEOUT_MS;
+    else process.env.LOCAL_AI_STYLE_TIMEOUT_MS = priorTimeout;
+  });
+  const history = Array.from({ length: 183 }, (_, i) => ({ body: `Hello dear, please tell me what you need ${i}?` }));
+  const valid = fallbackStyleAnalysis(history);
+  const calls = [];
+  t.mock.method(require("axios"), "post", async (url, body, options) => {
+    calls.push({ url, body, options });
+    const content = JSON.stringify({ summary: valid.summary, rules: valid.rules });
+    return { data: { choices: [{ message: { content } }], message: { content } } };
+  });
+  for (const provider of ["llama.cpp", "ollama"]) {
+    const ai = new LocalAI(() => ({}));
+    t.mock.method(ai, "config", () => ({ provider, baseUrl: "http://127.0.0.1:1234", model: "test" }));
+    const analyzed = await ai.analyzeStyle(history);
+    assert.equal(analyzed.analysisMethod, "model");
+    assert.equal(analyzed.sampleCount, 183);
+    assert.equal(analyzed.modelSampleCount, 24);
+    assert.equal(analyzed.warning, "");
+  }
+  for (const call of calls) {
+    assert.equal(call.options.timeout, 900000);
+    assert.ok(call.body.messages[1].content.length < 3000);
+    assert.equal(call.body.max_tokens || call.body.options.num_predict, 320);
+  }
+});
+
+test("模型无效风格输出可降级，配置错误仍显示失败且进度不为100", async (t) => {
+  const ai = new LocalAI(() => ({}));
+  const axios = require("axios");
+  const post = t.mock.method(axios, "post", async () => ({ data: { choices: [{ message: { content: "{}" } }] } }));
+  const fallback = await ai.analyzeStyle([{ body: "Hello dear, please send a photo." }]);
+  assert.equal(fallback.analysisMethod, "statistics");
+  assert.match(fallback.warning, /未返回完整/);
+  post.mock.mockImplementation(async () => { throw Object.assign(new Error("invalid model configuration"), { response: { status: 400 } }); });
+  const { store, service } = fixture(t);
+  const chatId = conversationKey("primary", "style-error@c.us");
+  store.importHistory(chatId, "测试客户", [{ id: "style-error-1", accountId: "primary", direction: "outbound", body: "Hello dear", createdAt: 1 }]);
+  await assert.rejects(service.analyzeAccountStyle("primary", { force: true }), /invalid model configuration/);
+  assert.equal(store.getAccountStyle("primary").status, "error");
+  assert.equal(store.getAccountStyle("primary").progress, 0);
+  assert.equal(service.styleJobs.size, 0);
+});
+
 test("本地小模型格式异常时仍按历史样本生成可编辑风格", () => {
   const style = fallbackStyleAnalysis([
     { body: "Hello! Can I get more info on this?" },
@@ -1247,6 +1460,8 @@ test("WhatsApp 实时事件收到新客户首次招呼后立即发送智能体�
     createdAt: Date.now()
   });
   await completed;
+  // The message event precedes the account queue's final checkpoint write.
+  await service.accountQueueJobs.get("primary");
   assert.equal(session.sent[0].body, MANOS_LEAD_WELCOME);
   const outbound = store.listMessages(conversationKey("primary", "new-customer@c.us"), { markRead: false }).find((item) => item.direction === "outbound");
   assert.equal(outbound.metadata.source, "new-customer-welcome");

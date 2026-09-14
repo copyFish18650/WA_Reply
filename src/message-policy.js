@@ -32,7 +32,7 @@ function isSystemChatId(value) {
 
 function isSystemConversation(value = {}) {
   if (isSystemChatId(value)) return true;
-  if (SYSTEM_MESSAGE_TYPES.test(String(value.type || ""))) return true;
+  if (isSystemNotice(value)) return true;
   const identity = String(value.profileName || "").trim().toLowerCase();
   const body = String(value.body || value.lastMessagePreview || "");
   return /^(?:whatsapp|whatsapp business)$/.test(identity)
@@ -43,6 +43,18 @@ function isManosLead(value) {
   const body = String(value?.body ?? value ?? "");
   return /Manos\s*ID\s*[-–—]{1,2}\s*["“”']?[A-Z0-9_-]+["“”']?/i.test(body)
     && /(?:hello|hi)[\s\S]{0,80}(?:more info|information|details)/i.test(body);
+}
+
+function isSystemNotice(value = {}) {
+  const type = String(value.type || "").toLowerCase();
+  if (SYSTEM_MESSAGE_TYPES.test(type)) return true;
+  const body = String(value.body || "").trim();
+  return type === "notification_template" && (!body || body === "[notification_template]");
+}
+
+function isManosMarker(value) {
+  const body = String(value?.body ?? value ?? "").trim();
+  return /^Manos\s*ID\s*[-–—]{1,2}\s*["“”']?[A-Z0-9_-]+["“”']?\s*[.!。！]?$/i.test(body);
 }
 
 function isGreeting(value) {
@@ -63,7 +75,9 @@ module.exports = {
   NEW_CUSTOMER_WELCOME,
   isSystemChatId,
   isSystemConversation,
+  isSystemNotice,
   isManosLead,
+  isManosMarker,
   isGreeting,
   isAlbumFollowUp
 };

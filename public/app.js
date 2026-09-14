@@ -2,6 +2,11 @@ const state = {
   view: "inbox",
   status: null,
   conversations: [],
+  accountGroupId: "",
+  conversationRequest: 0,
+  conversationEpoch: 0,
+  chatRequest: 0,
+  statusRequest: 0,
   selectedChatId: "",
   active: null,
   filter: "all",
@@ -74,8 +79,89 @@ function agentById(agentId) {
 }
 
 function accountDisplayName(accountId) {
+  if (accountId === "demo") return "演示会话";
   const account = (state.status?.session?.accounts || []).find((item) => item.accountId === accountId);
   return account?.account?.name || account?.label || accountId;
+}
+
+function accountIsConnected(account) {
+  return account?.status === "ready" || (account?.status === "syncing" && Boolean(account.account?.id));
+}
+
+function conversationAccountId(contact) {
+  return contact?.accountId || (contact?.isDemo ? "demo" : String(contact?.chatId || "").split("::")[0]);
+}
+
+function conversationIsCurrent(chatId, epoch = state.conversationEpoch) {
+  return epoch === state.conversationEpoch && state.selectedChatId === chatId
+    && state.conversations.some((contact) => contact.chatId === chatId && conversationAccountId(contact) === state.accountGroupId);
+}
+
+function clearActiveConversation() {
+  state.chatRequest += 1;
+  state.conversationEpoch += 1;
+  state.selectedChatId = "";
+  state.active = null;
+  state.inspectorRequest = null;
+  state.inspectorCache.clear();
+  state.translationRequest = null;
+  state.translationBusy = false;
+  state.translationPending.clear();
+  state.translationFailed.clear();
+  clearAttachments();
+  $("#messageInput").value = "";
+  $("#messageInput").classList.remove("translating");
+  $("#sendButton").disabled = false;
+  $("#translateComposer").disabled = false;
+  $("#translateComposer").textContent = "翻译替换";
+  $("#replyLanguage").value = "auto";
+  $("#sendHint").textContent = "请先选择当前账号的会话";
+  $("#messageList").innerHTML = "";
+  $("#contactQuotes").innerHTML = "";
+  $("#customerMemoryList").innerHTML = "";
+  $("#learnedMemoryList").innerHTML = "";
+  $("#activityList").innerHTML = "";
+  $("#memoryText").value = "";
+  $("#memoryCurrentScene").value = "";
+  $("#memoryHistorySummary").value = "";
+  state.inspectorTab = "overview";
+  $("#handoffReason").textContent = "";
+  $("#handoffReason").classList.add("hidden");
+  renderActiveConversation();
+}
+
+function setConversationGroup(accountId) {
+  if (accountId === state.accountGroupId) return false;
+  state.accountGroupId = accountId;
+  state.conversationRequest += 1;
+  state.conversations = [];
+  clearActiveConversation();
+  renderConversationGroups();
+  renderConversations();
+  return true;
+}
+
+function renderConversationGroups() {
+  const accounts = state.status?.session?.accounts || [];
+  const selector = $("#conversationAccount");
+  const names = { ready: "在线", qr: "等待扫码", syncing: "同步中", starting: "连接中", authenticated: "已登录", offline: "离线", error: "连接异常" };
+  selector.innerHTML = `${accounts.length ? "" : '<option value="">暂无 WhatsApp 账号</option>'}${accounts.map((account) => `<option value="${escapeHtml(account.accountId)}">${escapeHtml(accountDisplayName(account.accountId))} · ${escapeHtml(names[account.status] || account.status || "离线")}</option>`).join("")}<option value="demo">演示会话</option>`;
+  selector.value = state.accountGroupId;
+}
+
+function reconcileConversationGroups() {
+  const accounts = state.status?.session?.accounts || [];
+  const valid = state.accountGroupId === "demo" || accounts.some((account) => account.accountId === state.accountGroupId);
+  const preferred = accounts.find((account) => account.account?.id || ["ready", "authenticated", "syncing"].includes(account.status)) || accounts[0];
+  const changed = !valid && setConversationGroup(preferred?.accountId || "");
+  renderConversationGroups();
+  renderConversations();
+  if (state.active?.contact) {
+    const name = accountDisplayName(conversationAccountId(state.active.contact));
+    $("#activeAccountName").textContent = name;
+    $("#inspectorAccount").textContent = name;
+  }
+  return changed;
 }
 
 function showView(view) {
@@ -88,9 +174,13 @@ function showView(view) {
 }
 
 async function loadStatus() {
+  const request = ++state.statusRequest;
   const payload = await api("/api/status");
+  if (request !== state.statusRequest) return state.status;
   state.status = payload;
+  const groupChanged = reconcileConversationGroups();
   renderStatus();
+  if (groupChanged) await loadConversations();
   return payload;
 }
 
@@ -98,23 +188,27 @@ function renderStatus() {
   const payload = state.status;
   if (!payload) return;
   const session = payload.session || {};
-  const connected = Number(session.readyCount || 0) > 0;
   const accounts = session.accounts || [];
+  const connectedCount = accounts.filter(accountIsConnected).length;
+  const connected = connectedCount > 0;
+  const syncing = accounts.some((account) => accountIsConnected(account) && account.status === "syncing");
   const pill = $("#connectionButton");
   pill.className = `connection-pill ${session.status || "offline"}`;
-  $("#connectionText").textContent = connected ? `${session.readyCount} 个账号在线` : ({ qr: "等待扫码", starting: "正在启动", syncing: "同步历史中", authenticated: "登录成功", error: "连接异常" }[session.status] || "WhatsApp 未连接");
-  $("#aiDot").className = payload.ai?.ok ? "ok" : "bad";
-  $("#aiStatusText").textContent = payload.ai?.ok ? `本地模型 · ${payload.ai.model || "在线"}` : "本地模型离线";
-  $("#metricAi").textContent = payload.ai?.ok ? "运行中" : "离线";
+  $("#connectionText").textContent = connected ? `${connectedCount} 个账号在线${syncing ? " · 同步历史中" : ""}` : ({ qr: "等待扫码", starting: "正在启动", syncing: "同步历史中", authenticated: "登录成功", error: "连接异常" }[session.status] || "WhatsApp 未连接");
+  const inference = payload.ai?.inference;
+  const jobLabel = ({ reply: "生成回复", translation: "翻译", background: "翻译聊天记录", memory: "整理记忆", style: "学习风格" })[inference?.active?.kind] || "处理中";
+  $("#aiDot").className = payload.ai?.ok ? inference?.busy ? "busy" : "ok" : "bad";
+  $("#aiStatusText").textContent = payload.ai?.ok ? inference?.busy ? `本地模型 · ${jobLabel}${inference.queued ? ` · 排队 ${inference.queued}` : ""}` : `本地模型 · ${payload.ai.model || "在线"}` : "本地模型离线";
+  $("#metricAi").textContent = payload.ai?.ok ? inference?.busy ? jobLabel : "空闲" : "离线";
   $("#metricAiDetail").textContent = `${payload.ai?.provider || "—"} · ${payload.ai?.model || "—"}`;
   $("#metricMessages").textContent = payload.stats?.messages || 0;
   $("#metricHuman").textContent = payload.stats?.humanNeeded || 0;
   $("#metricQuotes").textContent = payload.stats?.pendingQuotes || 0;
   $("#navQuoteBadge").textContent = payload.stats?.pendingQuotes || 0;
   $("#navQuoteBadge").classList.toggle("hidden", !(payload.stats?.pendingQuotes > 0));
-  $("#syncButton").disabled = !connected;
-  $("#accountSummary").textContent = `${accounts.length} 个账号 · ${session.readyCount || 0} 个在线`;
-  $("#connectionDetail").innerHTML = `<strong>聚合收件箱</strong> · 每个号码绑定一个可复用智能体，并保留自己的登录、开关和消息队列。`;
+  $("#syncButton").disabled = !accounts.some((account) => account.status === "ready");
+  $("#accountSummary").textContent = `${accounts.length} 个账号 · ${connectedCount} 个在线`;
+  $("#connectionDetail").innerHTML = `<strong>按账号分组</strong> · 每个号码拥有独立会话、登录、开关和消息队列；退出后清空该账号会话。`;
   const stateNames = { ready: "已连接", qr: "等待扫码", syncing: "同步中", starting: "启动中", authenticated: "已认证", offline: "离线", error: "异常" };
   $("#accountList").innerHTML = accounts.map((account) => {
     const sync = account.sync || {};
@@ -124,7 +218,7 @@ function renderStatus() {
     const qr = account.qrDataUrl ? `<img class="account-qr" src="${account.qrDataUrl}" alt="${escapeHtml(name)} 登录二维码"><div class="account-qr-hint">手机 WhatsApp → 已关联设备 → 关联设备</div>` : "";
     const progress = account.status === "syncing" || sync.total ? `<div class="account-progress"><i style="width:${percent}%"></i></div><div class="account-qr-hint">${escapeHtml(sync.mode || "历史同步")} · ${sync.completed || 0}/${sync.total || 0} 会话 · ${sync.imported || 0} 条</div>` : "";
     const connectAction = ["offline", "error"].includes(account.status) ? `<button data-account-action="connect" data-account-id="${escapeHtml(account.accountId)}">重新连接</button>` : "";
-    const readAction = account.status === "ready" ? `<button class="sync" data-account-action="read-records" data-account-id="${escapeHtml(account.accountId)}">读取记录</button>` : "";
+    const readAction = accountIsConnected(account) ? `<button class="sync" data-account-action="read-records" data-account-id="${escapeHtml(account.accountId)}">读取记录</button>` : "";
     const style = account.style || {};
     const persona = style.persona || {};
     const automation = account.automation || {};
@@ -132,13 +226,13 @@ function renderStatus() {
     const queueStatus = automation.current
       ? `<span>正在回复 <b>${escapeHtml(automation.current.contactName)}</b></span><span>下一位 <b>${escapeHtml(automation.next?.contactName || "暂无")}</b></span>`
       : `<span>${automation.pendingCount ? `待回复 <b>${Number(automation.pendingCount)} 位客户</b>` : "当前没有待回复客户"}</span>`;
-    const automationMini = `<div class="account-automation-mini"><div class="account-automation-row"><div><strong>智能体接管</strong><span>${escapeHtml(automationNames[automation.status] || "已关闭")} · 队列 ${Number(automation.pendingCount || 0)}</span></div><label class="account-ai-switch" title="${persona.completed ? "开启后按队列顺序自动回复" : "请先完善智能体资料"}"><input type="checkbox" data-account-automation data-account-id="${escapeHtml(account.accountId)}" ${automation.enabled ? "checked" : ""} ${account.status === "ready" && (persona.completed || automation.enabled) ? "" : "disabled"}><i></i></label></div><div class="account-queue-mini">${queueStatus}</div></div>`;
+    const automationMini = `<div class="account-automation-mini"><div class="account-automation-row"><div><strong>智能体接管</strong><span>${escapeHtml(automationNames[automation.status] || "已关闭")} · 队列 ${Number(automation.pendingCount || 0)}</span></div><label class="account-ai-switch" title="${persona.completed ? "开启后按队列顺序自动回复" : "请先完善智能体资料"}"><input type="checkbox" data-account-automation data-account-id="${escapeHtml(account.accountId)}" ${automation.enabled ? "checked" : ""} ${accountIsConnected(account) && (persona.completed || automation.enabled) ? "" : "disabled"}><i></i></label></div><div class="account-queue-mini">${queueStatus}</div></div>`;
     const agentMini = `<div class="account-profile-mini ${persona.completed ? "complete" : "incomplete"}"><div><strong>智能体 · ${escapeHtml(style.agentName || "未配置")}</strong><span>${persona.completed ? `${escapeHtml(persona.tone)} · ${escapeHtml(persona.personality)}${style.sharedAccountCount > 1 ? ` · ${style.sharedAccountCount} 个号复用` : ""}` : "请补充业务、语气和性格后再开启接管"}</span></div><button data-account-action="configure-profile" data-account-id="${escapeHtml(account.accountId)}">管理智能体</button></div>`;
     return `<article class="account-card"><div class="account-card-head"><span class="account-icon">W</span><span class="account-copy"><strong>${escapeHtml(name)}</strong><span>${escapeHtml(accountIdText)}</span></span><span class="account-state ${escapeHtml(account.status)}">${escapeHtml(stateNames[account.status] || account.status)}</span></div>${progress}${qr}${agentMini}${automationMini}<div class="account-actions">${connectAction}${readAction}<button class="remove" data-account-action="remove" data-account-id="${escapeHtml(account.accountId)}">退出并移除</button></div></article>`;
   }).join("") || `<div class="list-empty">还没有 WhatsApp 账号</div>`;
   renderAccountQueues();
   renderAccountStyles();
-  const needsSetup = accounts.find((account) => account.status === "ready" && !account.style?.persona?.completed && !state.onboardingPrompted.has(account.accountId));
+  const needsSetup = accounts.find((account) => accountIsConnected(account) && !account.style?.persona?.completed && !state.onboardingPrompted.has(account.accountId));
   if (needsSetup && $("#modal").classList.contains("hidden")) {
     state.onboardingPrompted.add(needsSetup.accountId);
     setTimeout(() => openAccountProfile(needsSetup.accountId), 180);
@@ -168,12 +262,12 @@ function renderAccountQueues() {
     const last = automation.lastProcessedAt ? `最近完成：${escapeHtml(automation.lastContactName || "客户")} · ${escapeHtml(relativeTime(automation.lastProcessedAt))}` : "尚未执行过自动回复";
     const options = agents.map((item) => `<option value="${escapeHtml(item.id)}" ${item.id === style.agentId ? "selected" : ""}>${escapeHtml(item.name)}${item.accountCount > 1 ? ` · ${item.accountCount} 个号复用` : ""}</option>`).join("");
     return `<article class="account-queue-card ${automation.enabled ? "enabled" : "disabled"}" data-queue-account="${escapeHtml(account.accountId)}">
-      <div class="queue-card-head"><div class="queue-card-identity"><span class="account-icon">W</span><div><strong>${escapeHtml(name)}</strong><span>${escapeHtml(account.account?.id || account.accountId)} · ${account.status === "ready" ? "WhatsApp 在线" : "等待连接"}</span></div></div><div class="queue-master-control"><span><b>${escapeHtml(statusNames[automation.status] || "智能体已关闭")}</b><small>${persona.completed ? `${Number(automation.pendingCount || 0)} 位等待 · ${Number(automation.rawMessageCount || 0)} 条消息` : "请先完善绑定智能体"}</small></span><label class="account-ai-switch large" title="智能体接管总开关"><input type="checkbox" data-account-automation data-account-id="${escapeHtml(account.accountId)}" ${automation.enabled ? "checked" : ""} ${account.status === "ready" && (persona.completed || automation.enabled) ? "" : "disabled"}><i></i></label></div></div>
+      <div class="queue-card-head"><div class="queue-card-identity"><span class="account-icon">W</span><div><strong>${escapeHtml(name)}</strong><span>${escapeHtml(account.account?.id || account.accountId)} · ${accountIsConnected(account) ? account.status === "syncing" ? "WhatsApp 在线 · 同步历史中" : "WhatsApp 在线" : "等待连接"}</span></div></div><div class="queue-master-control"><span><b>${escapeHtml(statusNames[automation.status] || "智能体已关闭")}</b><small>${persona.completed ? `${Number(automation.pendingCount || 0)} 位等待 · ${Number(automation.rawMessageCount || 0)} 条消息` : "请先完善绑定智能体"}</small></span><label class="account-ai-switch large" title="智能体接管总开关"><input type="checkbox" data-account-automation data-account-id="${escapeHtml(account.accountId)}" ${automation.enabled ? "checked" : ""} ${accountIsConnected(account) && (persona.completed || automation.enabled) ? "" : "disabled"}><i></i></label></div></div>
       <div class="agent-assignment"><span class="agent-avatar">${escapeHtml(avatarText(agent.name || "智能体"))}</span><div class="agent-assignment-copy"><span>当前智能体</span><strong>${escapeHtml(agent.name || "未配置智能体")}</strong><small>${escapeHtml(agent.description || persona.business || "尚未补充业务说明")}</small></div><label><span>更换 / 复用</span><select data-agent-binding data-account-id="${escapeHtml(account.accountId)}" ${agents.length ? "" : "disabled"}>${options}</select></label></div>
       <div class="queue-flow"><div class="queue-now ${current ? "active" : ""}"><span>正在回复</span><strong>${escapeHtml(current?.contactName || (automation.enabled ? "等待新消息" : "开关未开启"))}</strong><p>${escapeHtml(current?.preview || "开启后会从队列第一位开始")}</p></div><div class="queue-arrow">→</div><div class="queue-next"><span>下一位</span><strong>${escapeHtml(next?.contactName || "暂无")}</strong><p>${escapeHtml(next?.preview || "队列已处理完")}</p></div></div>
       <div class="queue-list-head"><span>等待队列</span><small>${automation.mergedCount ? `已智能合并 ${Number(automation.mergedCount)} 条连续消息` : last}</small></div><div class="queue-people">${queueItems}</div>
       ${automation.lastError ? `<p class="queue-error">${escapeHtml(automation.lastError)}</p>` : ""}
-      <div class="queue-card-actions"><button data-account-action="edit-agent" data-account-id="${escapeHtml(account.accountId)}">编辑智能体</button><button data-account-action="clone-agent" data-account-id="${escapeHtml(account.accountId)}">复制为独立智能体</button><button data-account-action="read-records" data-account-id="${escapeHtml(account.accountId)}" ${account.status === "ready" ? "" : "disabled"}>读取记录并学习</button></div>
+      <div class="queue-card-actions"><button data-account-action="edit-agent" data-account-id="${escapeHtml(account.accountId)}">编辑智能体</button><button data-account-action="clone-agent" data-account-id="${escapeHtml(account.accountId)}">复制为独立智能体</button><button data-account-action="read-records" data-account-id="${escapeHtml(account.accountId)}" ${accountIsConnected(account) ? "" : "disabled"}>读取记录并学习</button></div>
     </article>`;
   }).join("");
 }
@@ -194,7 +288,7 @@ function renderAccountStyles() {
     const enabledRules = (agent.rules || []).filter((rule) => rule.enabled !== false).length;
     const welcomeSteps = agent.welcomeFlow?.enabled === false ? 0 : Number(agent.welcomeFlow?.steps?.length || 0);
     const gender = ({ female: "女性形象", male: "男性形象", neutral: "中性形象" })[persona.gender] || "形象未设定";
-    return `<article class="style-card agent-card" data-agent-id="${escapeHtml(agent.id)}"><div class="style-card-head"><div class="style-card-identity"><span class="agent-avatar">${escapeHtml(avatarText(agent.name))}</span><div><strong>${escapeHtml(agent.name)}</strong><span>${escapeHtml(agent.description || "可复用销售智能体")}</span></div></div><span class="style-state ${escapeHtml(agent.status || "pending")}">${escapeHtml(styleNames[agent.status] || "待完善")}</span></div><div class="agent-chip-row"><span>${escapeHtml(gender)}</span><span>${escapeHtml(persona.tone || "语气未设定")}</span><span>${welcomeSteps ? `首访 ${welcomeSteps} 步` : "首访流程已关闭"}</span><span>${enabledRules} 条规则</span><span>${Number(agent.sampleCount || 0)} 条历史样本</span></div><div class="agent-card-content"><div><span>业务与角色</span><p>${escapeHtml(persona.business || "尚未填写主营业务")}</p></div><div><span>回复风格</span><p>${escapeHtml(agent.summary || persona.personality || "尚未形成回复风格")}</p></div></div><div class="agent-bound-row"><span>已绑定</span><div>${boundNames.length ? boundNames.map((name) => `<b>${escapeHtml(name)}</b>`).join("") : `<small>暂未绑定账号</small>`}</div></div><div class="style-card-actions agent-card-actions"><button class="reanalyze" data-agent-action="export" type="button">导出</button><button class="reanalyze" data-agent-action="clone" type="button">复制</button><button class="agent-delete" data-agent-action="delete" type="button" ${agent.accountCount ? "disabled" : ""}>删除</button><button class="save-style" data-agent-action="edit" type="button">编辑智能体</button></div></article>`;
+    return `<article class="style-card agent-card" data-agent-id="${escapeHtml(agent.id)}"><div class="style-card-head"><div class="style-card-identity"><span class="agent-avatar">${escapeHtml(avatarText(agent.name))}</span><div><strong>${escapeHtml(agent.name)}</strong><span>${escapeHtml(agent.description || "可复用销售智能体")}</span></div></div><span class="style-state ${escapeHtml(agent.status || "pending")}">${escapeHtml(agent.status === "ready" && agent.analysisMethod === "statistics" ? "基础风格" : styleNames[agent.status] || "待完善")}</span></div><div class="agent-chip-row"><span>${escapeHtml(gender)}</span><span>${escapeHtml(persona.tone || "语气未设定")}</span><span>${welcomeSteps ? `首访 ${welcomeSteps} 步` : "首访流程已关闭"}</span><span>${enabledRules} 条规则</span><span>${Number(agent.sampleCount || 0)} 条历史样本</span></div><div class="agent-card-content"><div><span>业务与角色</span><p>${escapeHtml(persona.business || "尚未填写主营业务")}</p></div><div><span>回复风格</span><p>${escapeHtml(agent.summary || persona.personality || "尚未形成回复风格")}</p>${agent.analysisWarning || agent.progressLabel ? `<p class="agent-analysis-note">${escapeHtml(agent.analysisWarning || agent.progressLabel)}</p>` : ""}</div></div><div class="agent-bound-row"><span>已绑定</span><div>${boundNames.length ? boundNames.map((name) => `<b>${escapeHtml(name)}</b>`).join("") : `<small>暂未绑定账号</small>`}</div></div><div class="style-card-actions agent-card-actions"><button class="reanalyze" data-agent-action="export" type="button">导出</button><button class="reanalyze" data-agent-action="clone" type="button">复制</button><button class="agent-delete" data-agent-action="delete" type="button" ${agent.accountCount ? "disabled" : ""}>删除</button><button class="save-style" data-agent-action="edit" type="button">编辑智能体</button></div></article>`;
   }).join("");
 }
 
@@ -247,19 +341,29 @@ function chooseAgentPackage() {
 }
 
 async function loadConversations() {
-  const params = new URLSearchParams({ filter: state.filter });
+  const accountId = state.accountGroupId;
+  const request = ++state.conversationRequest;
+  if (!accountId) {
+    state.conversations = [];
+    if (state.selectedChatId) clearActiveConversation();
+    renderConversations();
+    return;
+  }
+  const params = new URLSearchParams({ filter: state.filter, accountId });
   if (state.search) params.set("q", state.search);
   const payload = await api(`/api/conversations?${params}`);
-  state.conversations = payload.conversations || [];
+  if (request !== state.conversationRequest || accountId !== state.accountGroupId) return;
+  state.conversations = (payload.conversations || []).filter((contact) => conversationAccountId(contact) === accountId);
+  if (state.selectedChatId && !state.conversations.some((contact) => contact.chatId === state.selectedChatId)) clearActiveConversation();
   renderConversations();
-  if (state.selectedChatId && !state.active) await selectConversation(state.selectedChatId);
 }
 
 function renderConversations() {
   $("#conversationCount").textContent = `${state.conversations.length} 个客户`;
   const list = $("#conversationList");
   if (!state.conversations.length) {
-    list.innerHTML = `<div class="list-empty">暂无会话<br><small>扫码连接后会自动出现 WhatsApp 客户</small></div>`;
+    const hint = state.search || state.filter !== "all" ? "当前账号没有符合筛选条件的会话" : state.accountGroupId === "demo" ? "点击预览生成演示会话" : state.accountGroupId ? "登录后会同步该账号的客户会话" : "扫码连接后，按账号显示客户会话";
+    list.innerHTML = `<div class="list-empty">暂无会话<br><small>${hint}</small></div>`;
     return;
   }
   list.innerHTML = state.conversations.map((contact) => {
@@ -270,26 +374,31 @@ function renderConversations() {
     ].filter(Boolean).join("");
     return `<button class="conversation-item ${state.selectedChatId === contact.chatId ? "active" : ""}" data-chat-id="${escapeHtml(contact.chatId)}">
       <span class="avatar">${escapeHtml(avatarText(contact.profileName))}</span>
-      <span class="conversation-copy"><span class="conversation-name-row"><strong>${escapeHtml(contact.profileName)}</strong><time>${escapeHtml(relativeTime(contact.lastMessageAt))}</time></span><span class="conversation-preview"><span class="account-mini">${escapeHtml(contact.accountName || "账号")}</span><span class="message-preview">${escapeHtml(contact.lastMessagePreview || "暂无消息")}</span>${flags}</span></span>
+      <span class="conversation-copy"><span class="conversation-name-row"><strong>${escapeHtml(contact.profileName)}</strong><time>${escapeHtml(relativeTime(contact.lastMessageAt))}</time></span><span class="conversation-preview"><span class="account-mini">${escapeHtml(accountDisplayName(conversationAccountId(contact)))}</span><span class="message-preview">${escapeHtml(contact.lastMessagePreview || "暂无消息")}</span>${flags}</span></span>
       ${contact.unread ? `<span class="unread-dot">${contact.unread > 99 ? "99+" : contact.unread}</span>` : ""}
     </button>`;
   }).join("");
   $$(".conversation-item", list).forEach((button) => button.addEventListener("click", () => selectConversation(button.dataset.chatId)));
 }
 
-async function selectConversation(chatId) {
-  if (state.selectedChatId && state.selectedChatId !== chatId) clearAttachment();
-  if (state.selectedChatId !== chatId) state.translationFailed.clear();
+async function selectConversation(chatId, { refreshList = true } = {}) {
+  if (!state.conversations.some((contact) => contact.chatId === chatId && conversationAccountId(contact) === state.accountGroupId)) return;
+  if (state.selectedChatId !== chatId) clearActiveConversation();
   state.selectedChatId = chatId;
+  const epoch = state.conversationEpoch;
+  const request = ++state.chatRequest;
   renderConversations();
   const payload = await api(`/api/conversations/${encodeURIComponent(chatId)}/messages?limit=200`);
+  if (request !== state.chatRequest || !conversationIsCurrent(chatId, epoch)) return;
+  if (conversationAccountId(payload.contact) !== state.accountGroupId) return clearActiveConversation();
   state.active = payload;
   renderActiveConversation();
-  await loadConversations();
+  if (refreshList) await loadConversations();
 }
 
 function needsChineseTranslation(text) {
   const value = String(text || "").trim();
+  if (/^Manos\s*ID\s*[-–—]{1,2}\s*["“”']?[A-Z0-9_-]+["“”']?\s*[.!。！]?$/i.test(value)) return false;
   if (!value || !/[A-Za-z]{2}/.test(value) || /^(?:https?:\/\/|www\.)\S+$/i.test(value)) return false;
   const hanCount = (value.match(/[\p{Script=Han}]/gu) || []).length;
   const latinCount = (value.match(/[A-Za-z]/g) || []).length;
@@ -315,18 +424,21 @@ function translationMarkup(message) {
   if (state.translationFailed.has(key)) {
     return `<div class="message-translation pending"><span>${label}</span><button data-retry-translation="${escapeHtml(message.id)}" type="button">翻译失败，点击重试</button></div>`;
   }
-  return `<div class="message-translation pending"><span>${label}</span><div>仅翻译文字说明，本地翻译生成中…</div></div>`;
+  return `<div class="message-translation pending"><span>${label}</span><div>本地翻译处理中，客户回复优先…</div></div>`;
 }
 
 async function queueMessageTranslations(messages) {
   if (state.translationBusy || !state.selectedChatId) return;
   const chatId = state.selectedChatId;
+  const epoch = state.conversationEpoch;
   const missing = [...messages].reverse().filter((message) => {
     const key = `${chatId}::${message.id}`;
     return Boolean(translatableMessageText(message))
       && Number(message.metadata?.translationVersion || 0) < TRANSLATION_VERSION && !state.translationFailed.has(key);
   }).slice(0, 6);
   if (!missing.length) return;
+  const request = { chatId, epoch };
+  state.translationRequest = request;
   state.translationBusy = true;
   missing.forEach((message) => state.translationPending.add(`${chatId}::${message.id}`));
   try {
@@ -334,18 +446,25 @@ async function queueMessageTranslations(messages) {
       method: "POST",
       body: JSON.stringify({ messageIds: missing.map((message) => message.id) })
     });
-    if (state.selectedChatId === chatId && state.active) {
+    if (conversationIsCurrent(chatId, epoch) && state.active) {
       const translated = new Map((payload.messages || []).map((message) => [message.id, message]));
       state.active.messages = state.active.messages.map((message) => translated.get(message.id) || message);
       renderMessages(state.active.messages);
     }
   } catch (error) {
-    missing.forEach((message) => state.translationFailed.add(`${chatId}::${message.id}`));
-    if (state.selectedChatId === chatId && state.active) renderMessages(state.active.messages);
+    if (conversationIsCurrent(chatId, epoch) && state.active) {
+      missing.forEach((message) => state.translationFailed.add(`${chatId}::${message.id}`));
+      renderMessages(state.active.messages);
+    }
   } finally {
-    missing.forEach((message) => state.translationPending.delete(`${chatId}::${message.id}`));
-    state.translationBusy = false;
-    if (state.selectedChatId === chatId && state.active) setTimeout(() => queueMessageTranslations(state.active.messages), 80);
+    if (state.translationRequest === request) {
+      missing.forEach((message) => state.translationPending.delete(`${chatId}::${message.id}`));
+      state.translationBusy = false;
+      state.translationRequest = null;
+    }
+    if (conversationIsCurrent(chatId, epoch) && state.active) setTimeout(() => {
+      if (conversationIsCurrent(chatId, epoch) && state.active) queueMessageTranslations(state.active.messages);
+    }, 80);
   }
 }
 
@@ -365,11 +484,11 @@ function renderActiveConversation() {
   $("#activeInspector").classList.remove("hidden");
   ["#activeAvatar", "#inspectorAvatar"].forEach((id) => $(id).textContent = avatarText(contact.profileName));
   $("#activeName").textContent = contact.profileName;
-  $("#activeAccountName").textContent = contact.accountName || "账号";
+  $("#activeAccountName").textContent = accountDisplayName(conversationAccountId(contact));
   $("#activePhone").textContent = contact.phone || contact.providerChatId?.replace(/@.+$/, "") || "—";
   $("#inspectorName").textContent = contact.profileName;
   $("#inspectorPhone").textContent = contact.phone || contact.providerChatId?.replace(/@.+$/, "") || "—";
-  $("#inspectorAccount").textContent = contact.accountName || contact.accountId || "—";
+  $("#inspectorAccount").textContent = accountDisplayName(conversationAccountId(contact));
   $("#customerLabels").innerHTML = (contact.labels || []).map((label) => `<span>${escapeHtml(label)}</span>`).join("") || `<span>WhatsApp</span>`;
   const manualLock = contact.mode === "human";
   const temporaryHandoff = contact.needsHuman && !manualLock;
@@ -409,30 +528,32 @@ function showInspectorTab(tab = "overview", force = false) {
 
 async function loadInspectorInsights(force = false) {
   const chatId = state.selectedChatId;
+  const epoch = state.conversationEpoch;
   if (!chatId) return;
   const cached = state.inspectorCache.get(chatId);
   if (!force && cached && Date.now() - cached.loadedAt < 15000) {
     renderInspectorInsights(cached.payload);
     return cached.payload;
   }
-  if (state.inspectorRequest?.chatId === chatId) return state.inspectorRequest.promise;
+  if (state.inspectorRequest?.chatId === chatId && state.inspectorRequest.epoch === epoch) return state.inspectorRequest.promise;
   const promise = api(`/api/conversations/${encodeURIComponent(chatId)}/insights?limit=80`)
     .then((payload) => {
+      if (!conversationIsCurrent(chatId, epoch)) return null;
       state.inspectorCache.set(chatId, { payload, loadedAt: Date.now() });
-      if (state.selectedChatId === chatId) renderInspectorInsights(payload);
+      renderInspectorInsights(payload);
       return payload;
     })
     .catch((error) => {
-      if (state.selectedChatId === chatId) {
+      if (conversationIsCurrent(chatId, epoch)) {
         const target = state.inspectorTab === "memory" ? $("#customerMemoryList") : $("#activityList");
         if (target) target.innerHTML = `<div class="inspector-loading">${escapeHtml(error.message)}</div>`;
       }
       return null;
     })
     .finally(() => {
-      if (state.inspectorRequest?.chatId === chatId) state.inspectorRequest = null;
+      if (state.inspectorRequest?.promise === promise) state.inspectorRequest = null;
     });
-  state.inspectorRequest = { chatId, promise };
+  state.inspectorRequest = { chatId, epoch, promise };
   return promise;
 }
 
@@ -676,17 +797,21 @@ async function sendMessage() {
   const body = input.value.trim();
   const attachments = [...state.pendingAttachments];
   if ((!body && !attachments.length) || !state.selectedChatId) return;
+  const chatId = state.selectedChatId;
+  const epoch = state.conversationEpoch;
+  if (!conversationIsCurrent(chatId, epoch) || state.active?.contact?.chatId !== chatId) return;
   $("#sendButton").disabled = true;
   try {
     const payload = attachments.length
-      ? await api(`/api/conversations/${encodeURIComponent(state.selectedChatId)}/media`, {
+      ? await api(`/api/conversations/${encodeURIComponent(chatId)}/media`, {
           method: "POST",
           body: JSON.stringify({
             items: attachments.map(({ data, mimeType, filename }) => ({ data, mimeType, filename })),
             caption: body
           })
         })
-      : await api(`/api/conversations/${encodeURIComponent(state.selectedChatId)}/messages`, { method: "POST", body: JSON.stringify({ body }) });
+      : await api(`/api/conversations/${encodeURIComponent(chatId)}/messages`, { method: "POST", body: JSON.stringify({ body }) });
+    if (!conversationIsCurrent(chatId, epoch)) return;
     if (attachments.length && payload.failed) {
       const sentCount = Number(payload.messages?.length || 0);
       removeSentAttachments(sentCount);
@@ -697,7 +822,7 @@ async function sendMessage() {
       clearAttachments();
       toast(attachments.length ? `${payload.messages?.length || attachments.length} 个附件已按顺序发送` : payload.learned ? "人工回复已发送并加入本地问答记忆，后续相似问题可自动回复" : payload.resumed ? "人工回复已发送，会话已恢复自动；价格内容不会自动学习" : "人工回复已发送");
     }
-    await selectConversation(state.selectedChatId);
+    await selectConversation(chatId);
   } catch (error) { toast(error.message, "error"); }
   finally { $("#sendButton").disabled = false; }
 }
@@ -780,6 +905,9 @@ function handleMediaTransfer(event, source = "粘贴") {
 }
 
 async function pasteAttachmentFromClipboard() {
+  const chatId = state.selectedChatId;
+  const epoch = state.conversationEpoch;
+  if (!chatId) return;
   const button = $("#pasteAttachmentButton");
   button.disabled = true;
   try {
@@ -794,6 +922,7 @@ async function pasteAttachmentFromClipboard() {
       files.push(new File([blob], `剪贴板${mimeType.startsWith("video/") ? "视频" : "图片"}-${Date.now()}-${files.length + 1}${extension}`, { type: mimeType }));
     }
     if (!files.length) throw new Error("剪贴板中没有图片或视频");
+    if (!conversationIsCurrent(chatId, epoch)) return;
     await readAttachments(files, "从剪贴板读取");
   } catch (error) {
     $("#messageInput").focus();
@@ -813,6 +942,9 @@ function readFileAsDataUrl(file) {
 }
 
 async function readAttachments(files, source = "选择") {
+  const chatId = state.selectedChatId;
+  const epoch = state.conversationEpoch;
+  if (!chatId) return;
   const allowed = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "video/mp4", "video/webm", "video/quicktime", "video/x-m4v"]);
   const maxCount = 10;
   const maxBytes = 35 * 1024 * 1024;
@@ -829,6 +961,7 @@ async function readAttachments(files, source = "选择") {
     }
     try {
       const dataUrl = await readFileAsDataUrl(file);
+      if (!conversationIsCurrent(chatId, epoch)) return;
       const previewUrl = URL.createObjectURL(file);
       state.pendingAttachments.push({
         id: `attachment-${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -856,15 +989,18 @@ async function translateComposer() {
   const button = $("#translateComposer");
   const language = $("#replyLanguage").value;
   const original = input.value.trim();
-  if (!original) return;
+  const chatId = state.selectedChatId;
+  const epoch = state.conversationEpoch;
+  if (!original || !chatId) return;
   button.disabled = true;
   button.textContent = "翻译中";
   input.classList.add("translating");
   try {
     const payload = await api("/api/translate", {
       method: "POST",
-      body: JSON.stringify({ text: original, targetLanguage: language, chatId: state.selectedChatId })
+      body: JSON.stringify({ text: original, targetLanguage: language, chatId })
     });
+    if (!conversationIsCurrent(chatId, epoch)) return;
     if (input.value.trim() !== original) {
       toast("翻译已完成，但输入内容已变化，因此没有自动替换", "error");
       return;
@@ -1619,6 +1755,8 @@ function openAgentEditor(agentId, options = {}) {
       status: data.summary ? "ready" : "needs_input",
       progress: data.summary ? 100 : Number(agent.progress || 0),
       progressLabel: data.summary ? "智能体设定已保存" : "可从账号历史记录继续学习",
+      analysisMethod: data.summary ? "manual" : "",
+      analysisWarning: "",
       persona: { gender: data.gender, business: data.business, tone: data.tone, personality: data.personality },
       welcomeFlow: {
         enabled: $("[data-welcome-enabled]", form).checked,
@@ -1687,8 +1825,10 @@ async function readAccountRecords(accountId, button) {
   button.textContent = "读取中…";
   try {
     toast("正在读取聊天记录并分析该账号的语言风格…");
-    await api(`/api/whatsapp/accounts/${encodeURIComponent(accountId)}/read-records`, { method: "POST", body: "{}" });
-    toast("记录读取与语言风格分析完成");
+    const result = await api(`/api/whatsapp/accounts/${encodeURIComponent(accountId)}/read-records`, { method: "POST", body: "{}" });
+    toast(result.style?.analysisMethod === "statistics"
+      ? "记录读取完成，已生成基础风格；模型分析未完成，详情见智能体"
+      : result.style?.status === "needs_input" ? "记录读取完成，暂无可学习的本人回复" : "记录读取与语言风格分析完成");
     await Promise.all([loadStatus(), loadConversations()]);
   } catch (error) {
     toast(error.message, "error");
@@ -1703,15 +1843,23 @@ function scheduleRefresh(event) {
   try {
     update = JSON.parse(event?.data || "{}");
     if (update.chatId) state.inspectorCache.delete(update.chatId);
+    if (update.type === "account-cleared") {
+      state.statusRequest += 1;
+      if (update.accountId === state.accountGroupId) {
+        state.conversationRequest += 1;
+        state.conversations = [];
+        clearActiveConversation();
+        renderConversations();
+      }
+    }
   } catch (_) {}
   clearTimeout(state.refreshTimer);
   state.refreshTimer = setTimeout(async () => {
     try {
-      await Promise.all([loadStatus(), loadConversations()]);
+      await loadStatus();
+      await loadConversations();
       if (state.selectedChatId) {
-        const payload = await api(`/api/conversations/${encodeURIComponent(state.selectedChatId)}/messages?limit=200`);
-        state.active = payload;
-        renderActiveConversation();
+        await selectConversation(state.selectedChatId, { refreshList: false });
         if (["memory", "activity"].includes(state.inspectorTab) && (!update.chatId || update.chatId === state.selectedChatId)) await loadInspectorInsights(true);
       }
       if (state.view === "quotes") await loadQuotes();
@@ -1766,8 +1914,16 @@ function bindEvents() {
         openAccountProfile(accountId);
         return;
       } else if (action === "remove") {
-        if (!await confirmModal("退出并移除账号", "确认解除该 WhatsApp Web 登录并从工作台移除？已保存的聊天记录不会删除。")) return;
+        if (!await confirmModal("退出并移除账号", "确认退出该 WhatsApp 账号？该账号的会话和相关客户记录会清空，其他账号的会话不受影响。")) return;
         await api(`/api/whatsapp/accounts/${encodeURIComponent(accountId)}`, { method: "DELETE" });
+        state.statusRequest += 1;
+        state.conversationRequest += 1;
+        state.status.session.accounts = (state.status.session.accounts || []).filter((account) => account.accountId !== accountId);
+        if (state.accountGroupId === accountId) {
+          state.conversations = [];
+          clearActiveConversation();
+        }
+        reconcileConversationGroups();
         toast("账号已退出并移除");
       } else if (action === "read-records") {
         await readAccountRecords(accountId, button);
@@ -1775,7 +1931,8 @@ function bindEvents() {
       } else {
         await api(`/api/whatsapp/accounts/${encodeURIComponent(accountId)}/connect`, { method: "POST", body: "{}" });
       }
-      await Promise.all([loadStatus(), loadConversations()]);
+      await loadStatus();
+      await loadConversations();
     } catch (error) { toast(error.message, "error"); }
   });
   $("#accountQueueBoard").addEventListener("click", async (event) => {
@@ -1864,7 +2021,11 @@ function bindEvents() {
     try { toast("正在同步历史消息…"); await api("/api/whatsapp/sync", { method: "POST", body: "{}" }); await loadConversations(); toast("历史同步完成"); } catch (error) { toast(error.message, "error"); }
   });
   $("#seedButton").addEventListener("click", async () => {
-    try { const payload = await api("/api/dev/seed", { method: "POST", body: "{}" }); await loadConversations(); await selectConversation(payload.chatId); } catch (error) { toast(error.message, "error"); }
+    try { const payload = await api("/api/dev/seed", { method: "POST", body: "{}" }); setConversationGroup("demo"); await loadConversations(); await selectConversation(payload.chatId); } catch (error) { toast(error.message, "error"); }
+  });
+  $("#conversationAccount").addEventListener("change", async (event) => {
+    if (!setConversationGroup(event.target.value)) return;
+    try { await loadConversations(); } catch (error) { toast(error.message, "error"); }
   });
   $("#conversationSearch").addEventListener("input", (event) => { state.search = event.target.value; clearTimeout(event.target._timer); event.target._timer = setTimeout(loadConversations, 220); });
   $$("#conversationFilters button").forEach((button) => button.addEventListener("click", () => {
@@ -1932,7 +2093,8 @@ function bindEvents() {
 async function start() {
   bindEvents();
   try {
-    await Promise.all([loadStatus(), loadConversations()]);
+    await loadStatus();
+    await loadConversations();
     const stream = new EventSource("/api/events");
     stream.onmessage = scheduleRefresh;
     stream.onerror = () => {};

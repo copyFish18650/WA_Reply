@@ -11,7 +11,7 @@
     "db:backup": "node --disable-warning=ExperimentalWarning scripts/backup-database.js",
     "mysql:dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-mysql-dev.ps1",
     "local-ai:qwen35": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-qwen35.ps1",
-    "test": "node --disable-warning=ExperimentalWarning --test test/service.test.js",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js",
     "test:local-ai": "node scripts/local-ai-smoke.js"
   },
   "engines": {

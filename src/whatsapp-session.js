@@ -1,7 +1,8 @@
 const fs = require("fs");
 const path = require("path");
 const EventEmitter = require("events");
-const { isSystemChatId, isSystemConversation } = require("./message-policy");
+const { randomUUID } = require("crypto");
+const { isSystemChatId, isSystemConversation, isSystemNotice } = require("./message-policy");
 
 function browserExecutable() {
   const candidates = [
@@ -59,7 +60,7 @@ function messageFromMe(message, ownId = "") {
 }
 
 class AccountSession extends EventEmitter {
-  constructor({ accountId, clientId, label, authDir, getSettings, authStore = null, backupSyncIntervalMs = 300000, autoStart = false }) {
+  constructor({ accountId, clientId, label, authDir, getSettings, authStore = null, lastAccount = null, backupSyncIntervalMs = 300000, autoStart = false }) {
     super();
     this.accountId = accountId;
     this.clientId = clientId;
@@ -70,6 +71,11 @@ class AccountSession extends EventEmitter {
     this.backupSyncIntervalMs = Math.max(60000, Number(backupSyncIntervalMs || 300000));
     this.client = null;
     this.initializing = null;
+    this.lastAccount = lastAccount?.id ? { ...lastAccount } : null;
+    this.generation = 0;
+    this.instanceId = randomUUID();
+    this.retired = false;
+    this.connectedClient = null;
     this.recentInbound = new Map();
     this.state = {
       accountId,
@@ -86,12 +92,44 @@ class AccountSession extends EventEmitter {
   }
 
   setState(patch) {
+    if (this.retired) return;
     this.state = { ...this.state, ...patch, accountId: this.accountId, label: this.label, updatedAt: Date.now() };
     this.emit("status", this.getStatus());
   }
 
   getStatus() {
-    return { ...this.state, qrAvailable: Boolean(this.state.qrDataUrl) };
+    return { ...this.state, lastAccount: this.lastAccount, qrAvailable: Boolean(this.state.qrDataUrl) };
+  }
+
+  getIdentity() {
+    return `${this.instanceId}:${this.generation}`;
+  }
+
+  isCurrentClient(client, generation = this.generation) {
+    return !this.retired && this.client === client && this.generation === generation;
+  }
+
+  clearAccount(reason, nextAccount = null) {
+    const previousAccountId = this.lastAccount?.id || this.state.account?.id || "";
+    const previousGeneration = this.generation;
+    const previousConnectedClient = this.connectedClient;
+    this.generation += 1;
+    this.connectedClient = null;
+    try {
+      this.emit("account-cleared", {
+        accountId: this.accountId,
+        reason,
+        ...(previousAccountId ? { previousAccountId } : {}),
+        ...(nextAccount?.id ? { nextAccountId: nextAccount.id } : {})
+      });
+    } catch (error) {
+      this.generation = previousGeneration;
+      this.connectedClient = previousConnectedClient;
+      throw error;
+    }
+    this.recentInbound.clear();
+    // Remember the owner across QR/status resets and process restarts.
+    this.lastAccount = nextAccount || this.lastAccount;
   }
 
   accountName() {
@@ -177,17 +215,22 @@ class AccountSession extends EventEmitter {
   }
 
   async initialize() {
+    if (this.retired) throw new Error("WhatsApp 账号已移除");
     if (this.initializing) return this.initializing;
     if (this.client && ["qr", "authenticated", "syncing", "ready", "starting"].includes(this.state.status)) return this.getStatus();
     if (this.client) {
-      try { await this.client.destroy(); } catch (_) {}
+      const previous = this.client;
       this.client = null;
+      this.connectedClient = null;
+      try { await previous.destroy(); } catch (_) {}
     }
+    if (this.retired) throw new Error("WhatsApp 账号已移除");
     this.initializing = this.createClient().finally(() => { this.initializing = null; });
     return this.initializing;
   }
 
   async createClient() {
+    const generation = this.generation;
     this.setState({ status: "starting", message: "正在启动 WhatsApp Web…", qrDataUrl: "", sync: null });
     const { Client, LocalAuth, RemoteAuth } = require("whatsapp-web.js");
     const QRCode = require("qrcode");
@@ -197,6 +240,7 @@ class AccountSession extends EventEmitter {
       const sessionName = `RemoteAuth-${this.clientId}`;
       const legacyPath = path.join(this.authDir, `session-${this.clientId}`);
       const migration = await this.authStore.importLegacySession({ session: sessionName, profilePath: legacyPath });
+      if (this.retired || this.generation !== generation) return this.getStatus();
       authStrategy = new RemoteAuth({
         clientId: this.clientId,
         dataPath: this.authDir,
@@ -220,74 +264,117 @@ class AccountSession extends EventEmitter {
       takeoverTimeoutMs: 0
     });
     this.client = client;
+    const current = () => this.isCurrentClient(client);
 
     client.on("remote_session_saved", () => {
+      if (!current()) return;
       this.setState({ authPersistence: { stored: true, backedUpAt: Date.now(), encrypted: Boolean(this.authStore?.key) } });
     });
 
     client.on("qr", async (qr) => {
+      if (!current()) return;
+      const qrGeneration = this.generation;
       try {
         const qrDataUrl = await QRCode.toDataURL(qr, { errorCorrectionLevel: "M", margin: 2, width: 320 });
+        if (!this.isCurrentClient(client, qrGeneration)) return;
         this.setState({ status: "qr", message: "请用手机 WhatsApp 扫码登录", qrDataUrl, account: null });
       } catch (error) {
+        if (!this.isCurrentClient(client, qrGeneration)) return;
         this.setState({ status: "error", message: `二维码生成失败：${error.message}`, qrDataUrl: "" });
       }
     });
-    client.on("authenticated", () => this.setState({ status: "authenticated", message: "登录成功，正在载入会话…", qrDataUrl: "" }));
-    client.on("auth_failure", (message) => this.setState({ status: "error", message: `登录失效：${message}`, qrDataUrl: "", account: null }));
-    client.on("loading_screen", (percent, message) => this.handleLoadingScreen(percent, message));
+    client.on("authenticated", () => { if (current()) this.setState({ status: "authenticated", message: "登录成功，正在载入会话…", qrDataUrl: "" }); });
+    client.on("auth_failure", (message) => { if (current()) this.setState({ status: "error", message: `登录失效：${message}`, qrDataUrl: "", account: null }); });
+    client.on("loading_screen", (percent, message) => { if (current()) this.handleLoadingScreen(percent, message); });
     client.on("ready", async () => {
+      if (!current()) return;
       const info = client.info || {};
+      const account = { id: serializedId(info.wid), name: info.pushname || this.label, platform: info.platform || "WhatsApp Web" };
+      if (!account.id) return;
+      if (this.lastAccount?.id && this.lastAccount.id !== account.id) {
+        try { this.clearAccount("identity-changed", account); }
+        catch (error) {
+          this.connectedClient = null;
+          this.setState({ status: "error", message: `切换账号失败：${safeError(error).message}`, account: null, sync: null });
+          this.emit("session-error", safeError(error));
+          return;
+        }
+      }
+      if (!current()) return;
+      this.lastAccount = account;
+      this.connectedClient = client;
+      const readyGeneration = this.generation;
       this.setState({
         status: "syncing",
         message: "已连接，正在同步全部可用历史…",
         qrDataUrl: "",
-        account: { id: serializedId(info.wid), name: info.pushname || this.label, platform: info.platform || "WhatsApp Web" },
+        account,
         sync: { completed: 0, total: 0, imported: 0, errors: [] }
       });
       try {
         const sync = await this.syncHistory();
+        if (!this.isCurrentClient(client, readyGeneration)) return;
         this.setState({ status: "ready", message: sync.errors.length ? `已连接；${sync.errors.length} 个会话同步失败` : "WhatsApp 已连接，历史同步完成", sync: { ...sync, finishedAt: Date.now() } });
       } catch (error) {
+        if (!this.isCurrentClient(client, readyGeneration)) return;
         const normalized = safeError(error);
         this.emit("sync-error", normalized);
         this.setState({ status: "ready", message: `已连接；历史同步失败：${normalized.message}`, sync: { ...(this.state.sync || {}), fatalError: normalized.message } });
       }
     });
     client.on("disconnected", (reason) => {
-      if (this.client === client) this.client = null;
+      if (!current()) return;
+      this.client = null;
+      this.connectedClient = null;
+      if (["LOGOUT", "UNPAIRED", "UNPAIRED_IDLE"].includes(String(reason || "").toUpperCase())) {
+        try { this.clearAccount("logout"); }
+        catch (error) {
+          this.setState({ status: "error", message: `已退出，但会话清理失败：${safeError(error).message}`, qrDataUrl: "", account: null, sync: null });
+          this.emit("session-error", safeError(error));
+          return;
+        }
+      }
       this.setState({ status: "offline", message: `连接已断开：${reason}`, qrDataUrl: "", account: null });
     });
 
-    const receive = (message) => this.handleInboundOnce(message);
+    const receive = (message) => {
+      if (!current() || this.connectedClient !== client) return;
+      return this.handleInboundOnce(message, client, this.generation);
+    };
     client.on("message", receive);
     client.on("message_create", async (message) => {
+      if (!current() || this.connectedClient !== client) return;
+      const messageGeneration = this.generation;
       if (this.isFromMe(message)) {
         try {
           const normalized = await this.normalizeMessage(message, false);
+          if (!this.isCurrentClient(client, messageGeneration)) return;
           if (message.hasMedia && ["image", "video"].includes(message.type)) {
             try { normalized.media = await this.downloadMediaPayload(message, 2); } catch (error) { normalized.mediaError = safeError(error).message; }
           }
-          this.emit("outbound", normalized);
-        } catch (error) { this.emit("session-error", safeError(error)); }
+          if (this.isCurrentClient(client, messageGeneration)) this.emit("outbound", normalized);
+        } catch (error) { if (this.isCurrentClient(client, messageGeneration)) this.emit("session-error", safeError(error)); }
       } else {
         receive(message);
       }
     });
-    client.on("message_ack", (message, ack) => this.emit("ack", { accountId: this.accountId, id: messageId(message.id), ack }));
+    client.on("message_ack", (message, ack) => { if (current() && this.connectedClient === client) this.emit("ack", { accountId: this.accountId, id: messageId(message.id), ack }); });
 
     try {
       await client.initialize();
+      if (!current()) return this.getStatus();
       if (["starting", "authenticated"].includes(this.state.status) && client.pupPage) {
         const missedReadyEvent = await client.pupPage.evaluate(() => {
           const socket = window.require?.("WAWebSocketModel")?.Socket;
           return Boolean(socket?.hasSynced && typeof window.onAppStateHasSyncedEvent === "function" && typeof window.WWebJS === "undefined");
         }).catch(() => false);
-        if (missedReadyEvent) await client.pupPage.evaluate(() => window.onAppStateHasSyncedEvent());
+        if (missedReadyEvent && current()) await client.pupPage.evaluate(() => window.onAppStateHasSyncedEvent());
       }
     } catch (error) {
-      if (this.client === client) this.client = null;
+      const wasCurrent = current();
+      if (wasCurrent) this.client = null;
       try { await client.destroy(); } catch (_) {}
+      if (!wasCurrent || this.retired || this.client) return this.getStatus();
       const normalized = safeError(error);
       this.setState({ status: "error", message: `WhatsApp Web 启动失败：${normalized.message}`, qrDataUrl: "", account: null });
       throw normalized;
@@ -295,7 +382,8 @@ class AccountSession extends EventEmitter {
     return this.getStatus();
   }
 
-  async handleInboundOnce(message) {
+  async handleInboundOnce(message, client = this.client, generation = this.generation) {
+    if (!this.isCurrentClient(client, generation)) return;
     const id = messageId(message.id);
     const now = Date.now();
     for (const [key, value] of this.recentInbound) if (now - value > 120000) this.recentInbound.delete(key);
@@ -303,9 +391,11 @@ class AccountSession extends EventEmitter {
     if (id) this.recentInbound.set(id, now);
     try {
       const normalized = await this.normalizeMessage(message, false);
+      if (!this.isCurrentClient(client, generation)) return;
       if (normalized.isGroup && this.getSettings().ignoreGroups !== false) return;
       if (isSystemConversation(normalized)) return;
       try { const chat = await message.getChat(); await chat.sendSeen(); } catch (_) {}
+      if (!this.isCurrentClient(client, generation)) return;
       if (message.hasMedia && ["image", "video"].includes(message.type)) {
         try {
           const media = await this.downloadMediaPayload(message, 3);
@@ -314,9 +404,9 @@ class AccountSession extends EventEmitter {
           normalized.mediaError = safeError(error).message;
         }
       }
-      this.emit("message", normalized);
+      if (this.isCurrentClient(client, generation)) this.emit("message", normalized);
     } catch (error) {
-      this.emit("session-error", safeError(error));
+      if (this.isCurrentClient(client, generation)) this.emit("session-error", safeError(error));
     }
   }
 
@@ -350,8 +440,12 @@ class AccountSession extends EventEmitter {
   }
 
   async getChatSummaries() {
+    const client = this.client;
+    const generation = this.generation;
+    if (!client || !this.isCurrentClient(client, generation)) throw new Error("WhatsApp 尚未启动");
     try {
-      const chats = await this.client.getChats();
+      const chats = await client.getChats();
+      if (!this.isCurrentClient(client, generation)) throw new Error("WhatsApp 连接已切换或断开");
       return chats.map((chat) => ({
         chatId: serializedId(chat.id),
         profileName: chat.name || chat.formattedTitle || serializedId(chat.id).replace(/@.+$/, ""),
@@ -360,8 +454,9 @@ class AccountSession extends EventEmitter {
         timestamp: Number(chat.timestamp || 0)
       }));
     } catch (error) {
+      if (!this.isCurrentClient(client, generation)) throw error;
       const nativeError = safeError(error).message;
-      const rows = await this.client.pupPage.evaluate(() => {
+      const rows = await client.pupPage.evaluate(() => {
         const chats = window.require?.("WAWebCollections")?.Chat?.getModelsArray?.()
           || window.Store?.Chat?.getModelsArray?.()
           || [];
@@ -376,19 +471,27 @@ class AccountSession extends EventEmitter {
           };
         });
       });
+      if (!this.isCurrentClient(client, generation)) throw new Error("WhatsApp 连接已切换或断开");
       this.emit("sync-error", new Error(`标准会话读取失败，已启用兼容模式：${nativeError}`));
       return rows;
     }
   }
 
   async fetchMessagesForChat(chatId, limit) {
+    const client = this.client;
+    const generation = this.generation;
+    if (!client || !this.isCurrentClient(client, generation)) throw new Error("WhatsApp 尚未启动");
     try {
-      const chat = await this.client.getChatById(chatId);
+      const chat = await client.getChatById(chatId);
+      if (!this.isCurrentClient(client, generation)) throw new Error("WhatsApp 连接已切换或断开");
       if (!chat) throw new Error("会话不存在");
       const messages = await chat.fetchMessages({ limit: limit > 0 ? limit : Infinity });
       const normalized = [];
       for (const message of messages) {
+        if (!this.isCurrentClient(client, generation)) throw new Error("WhatsApp 连接已切换或断开");
         const row = await this.normalizeMessage(message, true);
+        if (!this.isCurrentClient(client, generation)) throw new Error("WhatsApp 连接已切换或断开");
+        if (isSystemNotice(row)) continue;
         if (["image", "video"].includes(row.type) && message.hasMedia) {
           try { row.media = await this.downloadMediaPayload(message, 2); } catch (error) { row.mediaError = safeError(error).message; }
         }
@@ -396,8 +499,9 @@ class AccountSession extends EventEmitter {
       }
       return normalized;
     } catch (error) {
+      if (!this.isCurrentClient(client, generation)) throw error;
       const nativeError = safeError(error).message;
-      const rows = await this.client.pupPage.evaluate(async ({ chatId, limit }) => {
+      const rows = await client.pupPage.evaluate(async ({ chatId, limit }) => {
         const chat = window.Store?.Chat?.get?.(chatId) || await window.WWebJS.getChat(chatId, { getAsModel: false });
         if (!chat) throw new Error("chat_not_found");
         const valid = (message) => !message.isNotification && !/(?:notification|protocol|ciphertext)/i.test(String(message.type || ""));
@@ -444,9 +548,11 @@ class AccountSession extends EventEmitter {
         if (limit > 0 && result.length > limit) result = result.slice(-limit);
         return result;
       }, { chatId, limit });
+      if (!this.isCurrentClient(client, generation)) throw new Error("WhatsApp 连接已切换或断开");
       this.emit("sync-error", new Error(`会话 ${chatId} 已使用兼容读取：${nativeError}`));
       const normalized = [];
       for (const row of rows) {
+        if (!this.isCurrentClient(client, generation)) throw new Error("WhatsApp 连接已切换或断开");
         const next = { ...row, accountId: this.accountId, accountName: this.accountName() };
         if (["image", "video"].includes(row.type)) {
           try { next.media = await this.downloadMessageMedia(row.id); } catch (mediaError) { next.mediaError = safeError(mediaError).message; }
@@ -458,10 +564,21 @@ class AccountSession extends EventEmitter {
   }
 
   async syncHistory() {
+    if (this.historySyncJob?.client === this.client && this.historySyncJob.generation === this.generation) return this.historySyncJob.promise;
+    const job = { client: this.client, generation: this.generation, promise: this.performHistorySync() };
+    this.historySyncJob = job;
+    try { return await job.promise; }
+    finally { if (this.historySyncJob === job) this.historySyncJob = null; }
+  }
+
+  async performHistorySync() {
     if (!this.client) throw new Error("WhatsApp 尚未启动");
+    const client = this.client;
+    const generation = this.generation;
     const configured = Number(this.getSettings().historySyncLimit);
-    const limit = Number.isFinite(configured) && configured > 0 ? Math.min(configured, 5000) : 0;
+    const limit = Number.isFinite(configured) && configured > 0 ? Math.min(Math.floor(configured), 50000) : 0;
     const chats = await this.getChatSummaries();
+    if (!this.isCurrentClient(client, generation)) throw new Error("历史同步已中止：WhatsApp 连接已切换或断开");
     const eligible = chats
       .filter((chat) => chat.chatId
         && !isSystemChatId(chat.chatId)
@@ -472,8 +589,10 @@ class AccountSession extends EventEmitter {
     const errors = [];
     this.setState({ sync: { completed, total: eligible.length, imported, errors, mode: limit > 0 ? `最近 ${limit} 条/会话` : "全部可用历史" } });
     for (const chat of eligible) {
+      if (!this.isCurrentClient(client, generation)) throw new Error("历史同步已中止：WhatsApp 连接已切换或断开");
       try {
         const messages = await this.fetchMessagesForChat(chat.chatId, limit);
+        if (!this.isCurrentClient(client, generation)) throw new Error("历史同步已中止：WhatsApp 连接已切换或断开");
         imported += messages.length;
         this.emit("history", {
           accountId: this.accountId,
@@ -484,6 +603,7 @@ class AccountSession extends EventEmitter {
           messages
         });
       } catch (error) {
+        if (!this.isCurrentClient(client, generation)) throw error;
         const message = safeError(error).message;
         errors.push({ chatId: chat.chatId, profileName: chat.profileName, error: message });
         this.emit("sync-error", new Error(`同步 ${chat.profileName || chat.chatId} 失败：${message}`));
@@ -539,12 +659,16 @@ class AccountSession extends EventEmitter {
     }
   }
 
-  async logout() {
-    if (!this.client) return this.getStatus();
+  async logout({ clear = true } = {}) {
     const client = this.client;
+    if (clear) this.clearAccount("logout");
+    else this.generation += 1;
     this.client = null;
-    try { await client.logout(); } finally {
-      try { await client.destroy(); } catch (_) {}
+    this.connectedClient = null;
+    try {
+      if (client) await client.logout();
+    } finally {
+      if (client) { try { await client.destroy(); } catch (_) {} }
       this.setState({ status: "offline", message: "已退出 WhatsApp", qrDataUrl: "", account: null, sync: null });
     }
     return this.getStatus();
@@ -581,6 +705,7 @@ class WhatsAppSessionManager extends EventEmitter {
 
   loadRegistry() {
     let registry = [];
+    const hadRegistry = fs.existsSync(this.registryPath);
     if (this.persistence) {
       try { registry = this.persistence.listWhatsAppAccounts(); } catch (error) { throw new Error(`读取数据库中的 WhatsApp 账号失败：${error.message}`); }
       if (Array.isArray(registry) && registry.length) {
@@ -588,11 +713,10 @@ class WhatsAppSessionManager extends EventEmitter {
         return registry;
       }
     }
-    const hadRegistry = fs.existsSync(this.registryPath);
     try {
       if (hadRegistry) registry = JSON.parse(fs.readFileSync(this.registryPath, "utf8"));
     } catch (_) {}
-    if (!Array.isArray(registry) || !registry.length) {
+    if (!Array.isArray(registry) || (!registry.length && !hadRegistry)) {
       registry = [{ id: "primary", clientId: "sales-ai", label: "账号 1", createdAt: Date.now() }];
     }
     if (!hadRegistry) {
@@ -617,18 +741,25 @@ class WhatsAppSessionManager extends EventEmitter {
   }
 
   persistSessionStatus(status) {
-    if (!this.persistence || !status?.accountId) return;
+    if (!status?.accountId || !this.sessions.has(status.accountId)) return;
+    const meta = this.registry.find((item) => item.id === status.accountId);
+    if (!meta) return;
     const snapshot = {
       lastStatus: String(status.status || "offline"),
       statusMessage: String(status.message || ""),
       account: status.account || null,
+      lastAccount: status.lastAccount || meta.lastAccount || meta.account || null,
       sync: status.sync?.finishedAt ? status.sync : null,
       ...(status.status === "ready" ? { lastConnectedAt: Date.now() } : {})
     };
     const signature = JSON.stringify(snapshot);
     if (this.persistedStatus.get(status.accountId) === signature) return;
     this.persistedStatus.set(status.accountId, signature);
-    try { this.persistence.updateWhatsAppAccount(status.accountId, snapshot); } catch (error) { this.emit("session-error", safeError(error)); }
+    Object.assign(meta, snapshot);
+    try {
+      if (this.persistence) this.persistence.updateWhatsAppAccount(status.accountId, snapshot);
+      fs.writeFileSync(this.registryPath, JSON.stringify(this.registry, null, 2), "utf8");
+    } catch (error) { this.emit("session-error", safeError(error)); }
   }
 
   addSession(meta, autoStart = false) {
@@ -645,13 +776,17 @@ class WhatsAppSessionManager extends EventEmitter {
       authDir: this.authDir,
       getSettings: this.getSettings,
       authStore,
+      lastAccount: meta.lastAccount || meta.account || null,
       backupSyncIntervalMs: this.backupSyncIntervalMs,
       autoStart
     });
-    for (const event of ["history", "history-complete", "message", "outbound", "ack", "session-error", "sync-error"]) {
-      session.on(event, (payload) => this.emit(event, payload));
+    for (const event of ["account-cleared", "history", "history-complete", "message", "outbound", "ack", "session-error", "sync-error"]) {
+      session.on(event, (payload) => {
+        if (this.sessions.get(meta.id) === session && !session.retired) this.emit(event, payload);
+      });
     }
     session.on("status", (status) => {
+      if (this.sessions.get(meta.id) !== session || session.retired) return;
       this.persistSessionStatus(status);
       this.emit("status", this.getStatus());
     });
@@ -697,7 +832,7 @@ class WhatsAppSessionManager extends EventEmitter {
 
   async createAccount(label = "") {
     if (this.sessions.size >= 20) throw Object.assign(new Error("单机最多同时管理 20 个 WhatsApp 账号"), { statusCode: 409 });
-    const id = `account_${Date.now().toString(36)}`;
+    const id = `account_${randomUUID().replace(/-/g, "")}`;
     const meta = { id, clientId: id, label: String(label || `账号 ${this.sessions.size + 1}`), createdAt: Date.now() };
     this.registry.push(meta);
     this.saveRegistry();
@@ -712,29 +847,47 @@ class WhatsAppSessionManager extends EventEmitter {
     return session;
   }
 
+  getSessionIdentity(accountId) {
+    return this.sessions.get(String(accountId))?.getIdentity() || "";
+  }
+
   async connectAccount(accountId) {
     return this.getSession(accountId).initialize();
   }
 
   async removeAccount(accountId) {
     const session = this.getSession(accountId);
-    await session.logout();
     const meta = this.registry.find((item) => item.id === String(accountId));
+    // Detach before notifying consumers or awaiting browser teardown. Any late
+    // message/history callbacks from this client must be unable to refill data.
+    session.retired = true;
     this.sessions.delete(String(accountId));
+    try {
+      this.emit("account-cleared", {
+        accountId: String(accountId),
+        reason: "removed",
+        ...((session.lastAccount?.id || session.state.account?.id) ? { previousAccountId: session.lastAccount?.id || session.state.account?.id } : {})
+      });
+    } catch (error) {
+      session.retired = false;
+      this.sessions.set(String(accountId), session);
+      throw error;
+    }
+    this.persistedStatus.delete(String(accountId));
     this.registry = this.registry.filter((item) => item.id !== String(accountId));
-    if (meta?.clientId && /^[a-zA-Z0-9_-]+$/.test(meta.clientId)) {
-      const authPath = path.resolve(this.authDir, `session-${meta.clientId}`);
-      if (path.dirname(authPath) === this.authDir && path.basename(authPath) === `session-${meta.clientId}`) {
-        try { fs.rmSync(authPath, { recursive: true, force: true }); } catch (_) {}
-      }
-    }
-    if (!this.registry.length) {
-      const meta = { id: "primary", clientId: "sales-ai", label: "账号 1", createdAt: Date.now() };
-      this.registry.push(meta);
-      this.addSession(meta, false);
-    }
     this.saveRegistry();
     this.emit("status", this.getStatus());
+    try { await session.logout({ clear: false }); }
+    catch (error) { this.emit("session-error", safeError(error)); }
+    if (session.authStore?.delete) await session.authStore.delete({ session: `RemoteAuth-${session.clientId}` });
+    if (meta?.clientId && /^[a-zA-Z0-9_-]+$/.test(meta.clientId)) {
+      const names = [`session-${meta.clientId}`, `RemoteAuth-${meta.clientId}`, `RemoteAuth-${meta.clientId}.zip`, `wwebjs_temp_session_${meta.clientId}`];
+      for (const name of names) {
+        const authPath = path.resolve(this.authDir, name);
+        if (path.dirname(authPath) !== this.authDir || path.basename(authPath) !== name) throw new Error("WhatsApp 登录缓存路径无效");
+        fs.rmSync(authPath, { recursive: true, force: true });
+      }
+    }
     return this.getStatus();
   }
 

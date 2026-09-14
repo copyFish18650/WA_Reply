@@ -1,12 +1,16 @@
 param(
   [int]$GpuLayers = 0,
   [int]$ContextSize = 8192,
-  [int]$Parallel = 2
+  [int]$Parallel = 2,
+  [int]$Threads = [Math]::Min(12, [Environment]::ProcessorCount)
 )
 
 $ErrorActionPreference = "Stop"
 $localAiRoot = Join-Path $env:LOCALAPPDATA "WhatsAppSalesAI\local-ai"
 $serverPath = Join-Path $localAiRoot "llama-b10809-cuda\llama-server.exe"
+if (-not (Test-Path -LiteralPath $serverPath)) {
+  $serverPath = Join-Path $localAiRoot "llama-b10809-cpu\llama-server.exe"
+}
 $modelPath = Join-Path $localAiRoot "models\Qwen_Qwen3.5-9B-Q4_K_M.gguf"
 $port = 11435
 
@@ -34,9 +38,10 @@ $arguments = @(
   "--model", $modelPath,
   "--host", "127.0.0.1",
   "--port", "$port",
+  "--alias", "Qwen3.5-9B-Q4_K_M",
   "--ctx-size", "$ContextSize",
   "--parallel", "$Parallel",
-  "--threads", "12",
+  "--threads", "$Threads",
   "--gpu-layers", "$GpuLayers",
   "--flash-attn", "on",
   "--reasoning", "off",

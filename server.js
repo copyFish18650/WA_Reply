@@ -180,7 +180,12 @@ app.delete("/api/whatsapp/accounts/:accountId", async (req, res) => {
 });
 
 app.get("/api/conversations", (req, res) => {
-  res.json({ ok: true, conversations: store.listContacts(req.query.q, String(req.query.filter || "all")) });
+  res.json({ ok: true, conversations: service.listConversations(req.query.q, String(req.query.filter || "all"), String(req.query.accountId || "")) });
+});
+
+app.param("chatId", (req, res, next, chatId) => {
+  if (!service.isConversationAvailable(chatId)) return res.status(404).json({ ok: false, error: "会话所属账号已退出或会话不存在" });
+  next();
 });
 
 app.get("/api/conversations/:chatId/messages", (req, res) => {
@@ -234,6 +239,7 @@ app.post("/api/conversations/:chatId/translations", async (req, res) => {
 
 app.post("/api/translate", async (req, res) => {
   try {
+    if (req.body?.chatId && !service.isConversationAvailable(req.body.chatId)) throw Object.assign(new Error("会话所属账号已退出或会话不存在"), { statusCode: 404 });
     const translated = await service.translateText(req.body?.text, req.body?.targetLanguage || "auto", req.body?.chatId || "");
     res.json({ ok: true, ...translated, provider: "local" });
   } catch (error) { fail(res, error); }
@@ -275,7 +281,13 @@ app.post("/api/conversations/:chatId/messages/:messageId/media", async (req, res
 });
 
 app.get("/api/quotes", (req, res) => {
-  res.json({ ok: true, quotes: store.listQuotes(String(req.query.status || "all"), String(req.query.chatId || "")) });
+  res.json({ ok: true, quotes: store.listQuotes(String(req.query.status || "all"), String(req.query.chatId || "")).filter((quote) => service.isConversationAvailable(quote.chatId)) });
+});
+
+app.use("/api/quotes/:id", (req, res, next) => {
+  const quote = store.getQuote(req.params.id);
+  if (!quote || !service.isConversationAvailable(quote.chatId)) return res.status(404).json({ ok: false, error: "报价所属账号已退出或报价不存在" });
+  next();
 });
 
 app.get("/api/exchange-rates", async (_req, res) => {
@@ -330,8 +342,8 @@ app.put("/api/settings", (req, res) => {
     if (patch.contextMessageLimit !== undefined && (Number(patch.contextMessageLimit) < 10 || Number(patch.contextMessageLimit) > 200)) {
       throw Object.assign(new Error("上下文消息数必须在 10 到 200 之间"), { statusCode: 400 });
     }
-    if (patch.historySyncLimit !== undefined && (Number(patch.historySyncLimit) < 0 || Number(patch.historySyncLimit) > 5000)) {
-      throw Object.assign(new Error("历史同步条数必须在 0 到 5000 之间，0 表示全部"), { statusCode: 400 });
+    if (patch.historySyncLimit !== undefined && (!Number.isInteger(Number(patch.historySyncLimit)) || Number(patch.historySyncLimit) < 0 || Number(patch.historySyncLimit) > 50000)) {
+      throw Object.assign(new Error("历史同步条数必须是 0 到 50000 之间的整数，0 表示全部"), { statusCode: 400 });
     }
     res.json({ ok: true, settings: store.updateSettings(patch) });
     service.publish("settings", {});

@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>WA Sales · 智能聊单工作台</title>
-  <link rel="stylesheet" href="/style.css?v=20260910-2" />
+  <link rel="stylesheet" href="/style.css?v=20260912-accounts" />
 </head>
 <body>
   <div class="app-shell">
@@ -59,6 +59,7 @@
                 <div><h2>会话</h2><span id="conversationCount">0 个客户</span></div>
                 <button id="seedButton" class="tiny-button" title="生成预览数据">预览</button>
               </div>
+              <label class="conversation-account"><span>会话账号</span><select id="conversationAccount" aria-label="选择会话账号"><option value="">正在读取账号…</option></select></label>
               <label class="search-box">
                 <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
                 <input id="conversationSearch" placeholder="搜索客户、号码或消息" />
@@ -208,7 +209,7 @@
           <div class="page-heading"><div><span class="eyebrow">CONFIGURATION</span><h2>系统设置</h2><p>连接信息仅保存在这个独立项目的本地 data 目录。</p></div></div>
           <form id="settingsForm" class="settings-card">
             <div class="settings-section"><div class="settings-copy"><h3>本地模型</h3><p>当前已配置本机 llama.cpp；也可切换到 Ollama。</p></div><div class="form-grid"><label>模型服务<select name="localAiProvider"><option value="llama.cpp">llama.cpp</option><option value="ollama">Ollama</option></select></label><label>接口地址<input name="localAiBaseUrl" /></label><label>模型名<input name="localAiModel" /></label><label>上下文消息数<input name="contextMessageLimit" type="number" min="10" max="200" /></label></div></div>
-            <div class="settings-section"><div class="settings-copy"><h3>WhatsApp 历史</h3><p>每个已扫码账号分别同步。填写 0 会持续向前翻页，直到取完 WhatsApp Web 当前可用的全部历史。</p></div><div class="form-grid"><label>每会话同步条数（0 = 全部）<input name="historySyncLimit" type="number" min="0" max="5000" /></label><label class="checkbox-label"><input name="ignoreGroups" type="checkbox" /><span>忽略群聊消息</span></label></div></div>
+            <div class="settings-section"><div class="settings-copy"><h3>WhatsApp 历史</h3><p>每个已扫码账号分别同步。每会话可设置最多 50,000 条；填写 0 会持续向前翻页，直到取完 WhatsApp Web 当前可用的全部历史。</p></div><div class="form-grid"><label>每会话同步条数（0 = 全部）<input name="historySyncLimit" type="number" min="0" max="50000" step="1" /></label><label class="checkbox-label"><input name="ignoreGroups" type="checkbox" /><span>忽略群聊消息</span></label></div></div>
             <div class="settings-section"><div class="settings-copy"><h3>共享货源搜图</h3><p>搜图结果先生成 CNY 基础价；运费、利润率、最终价和 Manos 同款 GBP/EUR/USD/AUD 币种均可在报价审核中手动调整。</p></div><div class="form-grid"><label class="wide">搜图接口地址<input name="supplierSearchUrl" placeholder="https://supplier.example.com/image-search" /></label><label>API Key<input name="supplierApiKey" type="password" placeholder="留空保留已有值" /></label><label>搜图基础价倍率<input name="quoteMarkup" type="number" min="0.01" max="20" step="0.01" /></label></div></div>
             <div class="settings-section"><div class="settings-copy"><h3>客服规则</h3><p>这些规则会和历史聊天一起提供给本地模型。</p></div><div class="form-grid"><label>店铺名<input name="businessName" /></label><label class="wide">回复原则<textarea name="businessGuidelines" rows="4"></textarea></label></div></div>
             <div class="form-actions"><span id="settingsHint"></span><button type="submit" class="primary-button">保存设置</button></div>
@@ -220,6 +221,6 @@
 
   <div id="modal" class="modal hidden" role="dialog" aria-modal="true"><div class="modal-card"><button id="modalClose" class="modal-close">×</button><div id="modalBody"></div></div></div>
   <div id="toastStack" class="toast-stack"></div>
-  <script src="/app.js?v=20260911-2"></script>
+  <script src="/app.js?v=20260912-auto-reply"></script>
 </body>
 </html>
