@@ -143,10 +143,20 @@ function setConversationGroup(accountId) {
 
 function renderConversationGroups() {
   const accounts = state.status?.session?.accounts || [];
-  const selector = $("#conversationAccount");
   const names = { ready: "在线", qr: "等待扫码", syncing: "同步中", starting: "连接中", authenticated: "已登录", offline: "离线", error: "连接异常" };
-  selector.innerHTML = `${accounts.length ? "" : '<option value="">暂无 WhatsApp 账号</option>'}${accounts.map((account) => `<option value="${escapeHtml(account.accountId)}">${escapeHtml(accountDisplayName(account.accountId))} · ${escapeHtml(names[account.status] || account.status || "离线")}</option>`).join("")}<option value="demo">演示会话</option>`;
-  selector.value = state.accountGroupId;
+  const visible = [...accounts];
+  if (state.accountGroupId === "demo" || !accounts.length) visible.push({ accountId: "demo", status: "demo", inbox: {} });
+  $("#conversationAccountTabs").innerHTML = visible.map((account) => {
+    const unread = Number(account.inbox?.unread || 0);
+    const pending = Number(account.inbox?.pendingQuotes || 0);
+    const label = account.accountId === "demo" ? "演示" : accountDisplayName(account.accountId);
+    const statusName = account.accountId === "demo" ? "预览" : names[account.status] || account.status || "离线";
+    return `<button type="button" role="tab" aria-selected="${account.accountId === state.accountGroupId}" class="account-tab ${account.accountId === state.accountGroupId ? "active" : ""}" data-account-tab="${escapeHtml(account.accountId)}" title="${escapeHtml(label)} · ${escapeHtml(statusName)}">
+      <i class="account-tab-dot ${escapeHtml(account.status || "offline")}"></i><span class="account-tab-name">${escapeHtml(label)}</span>
+      ${unread ? `<b class="account-tab-badge unread">未读 ${unread > 99 ? "99+" : unread}</b>` : ""}
+      ${pending ? `<b class="account-tab-badge review">待审 ${pending > 99 ? "99+" : pending}</b>` : ""}
+    </button>`;
+  }).join("") || '<span class="account-tabs-loading">暂无账号</span>';
 }
 
 function reconcileConversationGroups() {
@@ -286,9 +296,10 @@ function renderAccountStyles() {
     const persona = agent.persona || {};
     const boundNames = (agent.accountIds || []).map(accountDisplayName);
     const enabledRules = (agent.rules || []).filter((rule) => rule.enabled !== false).length;
+    const learnedExamples = Array.isArray(agent.styleExamples) ? agent.styleExamples.length : 0;
     const welcomeSteps = agent.welcomeFlow?.enabled === false ? 0 : Number(agent.welcomeFlow?.steps?.length || 0);
     const gender = ({ female: "女性形象", male: "男性形象", neutral: "中性形象" })[persona.gender] || "形象未设定";
-    return `<article class="style-card agent-card" data-agent-id="${escapeHtml(agent.id)}"><div class="style-card-head"><div class="style-card-identity"><span class="agent-avatar">${escapeHtml(avatarText(agent.name))}</span><div><strong>${escapeHtml(agent.name)}</strong><span>${escapeHtml(agent.description || "可复用销售智能体")}</span></div></div><span class="style-state ${escapeHtml(agent.status || "pending")}">${escapeHtml(agent.status === "ready" && agent.analysisMethod === "statistics" ? "基础风格" : styleNames[agent.status] || "待完善")}</span></div><div class="agent-chip-row"><span>${escapeHtml(gender)}</span><span>${escapeHtml(persona.tone || "语气未设定")}</span><span>${welcomeSteps ? `首访 ${welcomeSteps} 步` : "首访流程已关闭"}</span><span>${enabledRules} 条规则</span><span>${Number(agent.sampleCount || 0)} 条历史样本</span></div><div class="agent-card-content"><div><span>业务与角色</span><p>${escapeHtml(persona.business || "尚未填写主营业务")}</p></div><div><span>回复风格</span><p>${escapeHtml(agent.summary || persona.personality || "尚未形成回复风格")}</p>${agent.analysisWarning || agent.progressLabel ? `<p class="agent-analysis-note">${escapeHtml(agent.analysisWarning || agent.progressLabel)}</p>` : ""}</div></div><div class="agent-bound-row"><span>已绑定</span><div>${boundNames.length ? boundNames.map((name) => `<b>${escapeHtml(name)}</b>`).join("") : `<small>暂未绑定账号</small>`}</div></div><div class="style-card-actions agent-card-actions"><button class="reanalyze" data-agent-action="export" type="button">导出</button><button class="reanalyze" data-agent-action="clone" type="button">复制</button><button class="agent-delete" data-agent-action="delete" type="button" ${agent.accountCount ? "disabled" : ""}>删除</button><button class="save-style" data-agent-action="edit" type="button">编辑智能体</button></div></article>`;
+    return `<article class="style-card agent-card" data-agent-id="${escapeHtml(agent.id)}"><div class="style-card-head"><div class="style-card-identity"><span class="agent-avatar">${escapeHtml(avatarText(agent.name))}</span><div><strong>${escapeHtml(agent.name)}</strong><span>${escapeHtml(agent.description || "可复用销售智能体")}</span></div></div><span class="style-state ${escapeHtml(agent.status || "pending")}">${escapeHtml(agent.status === "ready" && agent.analysisMethod === "statistics" ? "基础风格" : styleNames[agent.status] || "待完善")}</span></div><div class="agent-chip-row"><span>${escapeHtml(gender)}</span><span>${escapeHtml(persona.tone || "语气未设定")}</span><span>${welcomeSteps ? `首访 ${welcomeSteps} 步` : "首访流程已关闭"}</span><span>${enabledRules} 条规则</span><span>${Number(agent.sampleCount || 0)} 条历史样本</span><span>${learnedExamples} 组对话习惯</span></div><div class="agent-card-content"><div><span>业务与角色</span><p>${escapeHtml(persona.business || "尚未填写主营业务")}</p></div><div><span>回复风格</span><p>${escapeHtml(agent.summary || persona.personality || "尚未形成回复风格")}</p>${agent.analysisWarning || agent.progressLabel ? `<p class="agent-analysis-note">${escapeHtml(agent.analysisWarning || agent.progressLabel)}</p>` : ""}</div></div><div class="agent-bound-row"><span>已绑定</span><div>${boundNames.length ? boundNames.map((name) => `<b>${escapeHtml(name)}</b>`).join("") : `<small>暂未绑定账号</small>`}</div></div><div class="style-card-actions agent-card-actions"><button class="reanalyze" data-agent-action="export" type="button">导出</button><button class="reanalyze" data-agent-action="clone" type="button">复制</button><button class="agent-delete" data-agent-action="delete" type="button" ${agent.accountCount ? "disabled" : ""}>删除</button><button class="save-style" data-agent-action="edit" type="button">编辑智能体</button></div></article>`;
   }).join("");
 }
 
@@ -374,7 +385,7 @@ function renderConversations() {
     ].filter(Boolean).join("");
     return `<button class="conversation-item ${state.selectedChatId === contact.chatId ? "active" : ""}" data-chat-id="${escapeHtml(contact.chatId)}">
       <span class="avatar">${escapeHtml(avatarText(contact.profileName))}</span>
-      <span class="conversation-copy"><span class="conversation-name-row"><strong>${escapeHtml(contact.profileName)}</strong><time>${escapeHtml(relativeTime(contact.lastMessageAt))}</time></span><span class="conversation-preview"><span class="account-mini">${escapeHtml(accountDisplayName(conversationAccountId(contact)))}</span><span class="message-preview">${escapeHtml(contact.lastMessagePreview || "暂无消息")}</span>${flags}</span></span>
+      <span class="conversation-copy"><span class="conversation-name-row"><strong>${escapeHtml(contact.profileName)}</strong><time>${escapeHtml(relativeTime(contact.lastMessageAt))}</time></span><span class="conversation-preview"><span class="message-preview">${escapeHtml(contact.lastMessagePreview || "暂无消息")}</span>${flags}</span></span>
       ${contact.unread ? `<span class="unread-dot">${contact.unread > 99 ? "99+" : contact.unread}</span>` : ""}
     </button>`;
   }).join("");
@@ -717,7 +728,7 @@ function renderMessages(messages) {
   for (const [index, message] of messages.entries()) {
     const nextDay = new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "long", day: "numeric" }).format(new Date(message.createdAt));
     if (nextDay !== day) { day = nextDay; html.push(`<div class="day-divider"><span>${escapeHtml(day)}</span></div>`); }
-    const sourceLabel = ({ ai: "AI", "identity-policy": "客服身份", "customer-care": "关怀回复", "account-rule": "账号规则", "human-memory": "人工记忆", "quote-review": "审核报价", "quote-rejected": "缺货通知", "lead-welcome": "询盘欢迎", "new-customer-welcome": "新客欢迎", "album-follow-up": "相册跟进", "factory-inquiry": "询问工厂", "supplier-specification": "货源规格" })[message.metadata?.source];
+    const sourceLabel = ({ ai: "AI", "ai-catalog": "AI 判断相册", "ai-task-acknowledgement": "AI 回应并建待办", "identity-policy": "客服身份", "customer-care": "关怀回复", "account-rule": "账号规则", "human-memory": "人工记忆", "quote-review": "审核报价", "quote-rejected": "缺货通知", "lead-welcome": "询盘欢迎", "new-customer-welcome": "新客欢迎", "album-follow-up": "相册跟进", "factory-inquiry": "询问工厂", "supplier-specification": "货源规格" })[message.metadata?.source];
     const source = sourceLabel ? `<span class="source-badge">${sourceLabel}</span>` : "";
     const automationState = message.metadata?.automationState || "";
     const automationLabel = ({ queued: "排队中", processing: "生成中", replied: "已回复", handoff: "需人工", quote_pending: "报价待审", dismissed: "报价已删除", superseded: "已合并", failed: "失败" })[automationState] || "";
@@ -2020,11 +2031,9 @@ function bindEvents() {
   $("#syncButton").addEventListener("click", async () => {
     try { toast("正在同步历史消息…"); await api("/api/whatsapp/sync", { method: "POST", body: "{}" }); await loadConversations(); toast("历史同步完成"); } catch (error) { toast(error.message, "error"); }
   });
-  $("#seedButton").addEventListener("click", async () => {
-    try { const payload = await api("/api/dev/seed", { method: "POST", body: "{}" }); setConversationGroup("demo"); await loadConversations(); await selectConversation(payload.chatId); } catch (error) { toast(error.message, "error"); }
-  });
-  $("#conversationAccount").addEventListener("change", async (event) => {
-    if (!setConversationGroup(event.target.value)) return;
+  $("#conversationAccountTabs").addEventListener("click", async (event) => {
+    const tab = event.target.closest("[data-account-tab]");
+    if (!tab || !setConversationGroup(tab.dataset.accountTab)) return;
     try { await loadConversations(); } catch (error) { toast(error.message, "error"); }
   });
   $("#conversationSearch").addEventListener("input", (event) => { state.search = event.target.value; clearTimeout(event.target._timer); event.target._timer = setTimeout(loadConversations, 220); });

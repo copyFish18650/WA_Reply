@@ -55,9 +55,19 @@ svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width:
 .inbox-grid { height: 100%; min-height: 0; overflow: hidden; display: grid; grid-template-columns: 326px minmax(430px, 1fr) 330px; background: var(--panel); }
 .conversation-column, .chat-column, .inspector-column { min-width: 0; min-height: 0; height: 100%; overflow: hidden; background: var(--panel); }
 .conversation-column { display: grid; grid-template-rows: auto auto auto auto minmax(0, 1fr); border-right: 1px solid var(--line); }
-.conversation-account { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 8px; margin: 0 16px 12px; color: var(--muted); font-size: 12px; }
-.conversation-account select { min-width: 0; width: 100%; height: 34px; padding: 0 8px; border: 1px solid var(--line); border-radius: 8px; color: var(--text); background: var(--panel); font: inherit; }
-.conversation-account select:focus { outline: 2px solid #a9c8ff; outline-offset: 1px; }
+.conversation-account-tabs { display: flex; gap: 6px; min-width: 0; margin: 0 14px 10px; padding: 1px 1px 4px; overflow-x: auto; scrollbar-width: thin; }
+.account-tabs-loading { padding: 7px 3px; color: var(--muted); font-size: 11px; }
+.account-tab { flex: 0 0 auto; display: flex; align-items: center; gap: 5px; max-width: 190px; min-height: 32px; padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: #667085; font-size: 11px; cursor: pointer; }
+.account-tab:hover { background: #f7f9fc; border-color: #cbd8eb; }
+.account-tab.active { color: #155fce; border-color: #b9d2ff; background: var(--blue-soft); box-shadow: inset 0 -2px 0 var(--blue); }
+.account-tab-name { max-width: 82px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 650; }
+.account-tab-dot { flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: #aeb6c3; }
+.account-tab-dot.ready, .account-tab-dot.syncing, .account-tab-dot.authenticated { background: var(--green); }
+.account-tab-dot.qr, .account-tab-dot.starting { background: var(--amber); }
+.account-tab-dot.error { background: var(--red); }
+.account-tab-badge { flex: 0 0 auto; padding: 1px 5px; border-radius: 8px; font-size: 9px; line-height: 16px; white-space: nowrap; }
+.account-tab-badge.unread { color: #fff; background: var(--blue); }
+.account-tab-badge.review { color: #9a6200; background: var(--amber-soft); }
 .column-title { padding: 19px 18px 12px; display: flex; align-items: center; justify-content: space-between; }
 .column-title h2 { margin: 0 0 3px; font-size: 19px; }
 .column-title span { color: var(--muted); font-size: 12px; }

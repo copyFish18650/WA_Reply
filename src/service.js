@@ -7,7 +7,6 @@ const archiver = require("archiver");
 const unzipper = require("unzipper");
 const {
   LocalAI,
-  answerFromManualRules,
   isIdentityQuestion,
   customerServiceIdentityReply,
   enforceCustomerServiceIdentity
@@ -18,12 +17,13 @@ const { calculateFinalQuote, QUOTE_CURRENCIES, SHIPPING_OPTIONS_CNY } = require(
 const { generateQuotationImage } = require("./quotation-image");
 const { defaultQuotationNotes, normalizeQuotationNotes } = require("./quotation-notes");
 const {
+  MANOS_ALBUM_LINKS,
   MANOS_ALBUM_FOLLOW_UP,
   isSystemConversation,
+  isSpamMessage,
   isManosLead,
   isManosMarker,
-  isGreeting,
-  isAlbumFollowUp
+  isGreeting
 } = require("./message-policy");
 
 const HUMAN_TRIGGERS = [
@@ -34,11 +34,37 @@ const HUMAN_TRIGGERS = [
   { pattern: /人工|真人|经理|老板|human agent|manager/i, reason: "客户要求人工", alwaysHuman: true }
 ];
 const TRANSLATION_VERSION = 3;
+const STYLE_ANALYSIS_VERSION = 2;
 const QUOTE_REPLY_LANGUAGES = ["auto", "zh", "en", "fr", "es", "de", "it", "pt", "ar", "ru", "ja", "ko"];
 const AGENT_PACKAGE_FORMAT = "whatsapp-sales-ai-agent";
 const AGENT_PACKAGE_VERSION = 1;
 const AGENT_PACKAGE_MAX_BYTES = 200 * 1024 * 1024;
 const AGENT_MEDIA_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "video/mp4", "video/webm", "video/quicktime", "video/x-m4v"]);
+const MESSAGE_QUEUE_PRIORITIES = {
+  liveText: 0,
+  liveMedia: 5,
+  existing: 10,
+  historyText: 20,
+  historyMedia: 30
+};
+
+function messageQueuePriority(message, fallback = MESSAGE_QUEUE_PRIORITIES.existing) {
+  const value = Number(message?.metadata?.queuePriority);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function compareQueuedMessages(a, b) {
+  return messageQueuePriority(a) - messageQueuePriority(b)
+    || Number(a?.metadata?.queuedAt || a?.createdAt || 0) - Number(b?.metadata?.queuedAt || b?.createdAt || 0)
+    || Number(a?.createdAt || 0) - Number(b?.createdAt || 0);
+}
+
+function defaultQueuePriority(message, source = "live") {
+  const history = source === "history-sync" || message?.status === "history";
+  const text = message?.type === "text";
+  if (history) return text ? MESSAGE_QUEUE_PRIORITIES.historyText : MESSAGE_QUEUE_PRIORITIES.historyMedia;
+  return text ? MESSAGE_QUEUE_PRIORITIES.liveText : MESSAGE_QUEUE_PRIORITIES.liveMedia;
+}
 
 function isPriceQuestion(text) {
   return HUMAN_TRIGGERS[0].pattern.test(String(text || ""));
@@ -178,7 +204,7 @@ function casualFallbackReply(text, accountStyle = {}, context = []) {
 function isCasualMessage(text) {
   const value = String(text || "").trim();
   if (!value || CASUAL_BUSINESS_TERMS.test(value)) return false;
-  return /我(?:今天|刚|最近|现在|感觉|觉得|心情|工作|生活|家人|朋友)|聊聊天|早上好|下午好|晚上好|晚安|谢谢|抱歉|开心|难过|伤心|生病|不舒服|累|疲惫|存钱|努力工作|努力赚钱|来中国|去中国|见你|找你|打电话|通话|视频|背疼|腰疼|\b(?:i(?:'m| am| just| feel| felt| was| have| had|'ve| still| don't| do not| will)|my (?:day|work|family|friend|weekend)|today|yesterday|tonight|good morning|good evening|good night|thanks?|sorry|happy|sad|lonely|busy|tired|sick|unwell|weekend|save money|work hard|visit you|meet you|go to china|come to china|weather where you|how have you been|call me|phone me|video chat|back (?:still )?(?:hurt|hurts|pain|sore)|ugly old|old man|old woman)\b|\b(?:je suis|j'ai|ma journée|merci|désolé|fatigué|enfermo|estoy|mi día|gracias|cansado|ich bin|mein tag|danke|müde|sono|la mia giornata|grazie|estou|meu dia|obrigado)\b/i.test(value);
+  return /我(?:今天|刚|最近|现在|感觉|觉得|心情|工作|生活|家人|朋友)|聊聊天|天气|早上好|下午好|晚上好|晚安|谢谢|抱歉|开心|难过|伤心|生病|不舒服|累|疲惫|存钱|努力工作|努力赚钱|来中国|去中国|见你|找你|打电话|通话|视频|背疼|腰疼|\b(?:i(?:'m| am| just| feel| felt| was| have| had|'ve| still| don't| do not| will)|my (?:day|work|family|friend|weekend)|today|yesterday|tonight|weather|good morning|good evening|good night|thanks?|sorry|happy|sad|lonely|busy|tired|sick|unwell|weekend|save money|work hard|visit you|meet you|go to china|come to china|how have you been|call me|phone me|video chat|back (?:still )?(?:hurt|hurts|pain|sore)|ugly old|old man|old woman)\b|\b(?:je suis|j'ai|ma journée|merci|désolé|fatigué|enfermo|estoy|mi día|gracias|cansado|ich bin|mein tag|danke|müde|sono|la mia giornata|grazie|estou|meu dia|obrigado)\b/i.test(value);
 }
 
 function isCallRequest(text) {
@@ -422,6 +448,7 @@ class SalesService extends EventEmitter {
     this.translationJobs = new Map();
     this.memoryJobs = new Map();
     this.memoryTimers = new Map();
+    this.processingMessages = new Set();
     this.scopeAccountOperations();
     this.reconcileLegacyAccountConversations();
     this.store.recoverProcessingMessages();
@@ -595,6 +622,8 @@ class SalesService extends EventEmitter {
     });
     this.session.on("history", ({ accountId, accountName, chatId, profileName, messages, unread }) => {
       if (isSystemConversation({ chatId, profileName, body: messages?.at(-1)?.body })) return;
+      const customerMessages = (messages || []).filter((message) => !isSpamMessage(message));
+      if (!customerMessages.length) return;
       const conversationId = conversationKey(accountId, chatId);
       this.store.upsertContact(conversationId, {
         accountId,
@@ -603,7 +632,7 @@ class SalesService extends EventEmitter {
         profileName,
         phone: chatId.replace(/@.+$/, "")
       });
-      const normalized = messages.map((message) => {
+      const normalized = customerMessages.map((message) => {
         const row = {
           ...message,
           chatId: conversationId,
@@ -615,7 +644,8 @@ class SalesService extends EventEmitter {
         delete row.media;
         return row;
       });
-      const inserted = this.store.importHistory(conversationId, profileName, normalized, unread);
+      const cleanUnread = Math.min(Number(unread) || 0, customerMessages.filter((message) => message.direction === "inbound").length);
+      const inserted = this.store.importHistory(conversationId, profileName, normalized, cleanUnread);
       if (inserted) this.publish("history", { chatId: conversationId, accountId, inserted });
       if (inserted && this.store.getAccountAutomation(accountId).enabled) {
         this.catchUpRecentInbound(accountId, conversationId).catch((error) => {
@@ -624,7 +654,13 @@ class SalesService extends EventEmitter {
       }
     });
     this.session.on("history-complete", ({ accountId }) => {
-      this.ensureAccountStyle(accountId)
+      const currentStyle = this.store.getAccountStyle(accountId);
+      const needsQualityRefresh = ["model", "statistics"].includes(currentStyle.analysisMethod)
+        && Number(currentStyle.analysisVersion || 0) < STYLE_ANALYSIS_VERSION;
+      const styleWork = needsQualityRefresh
+        ? this.analyzeAccountStyle(accountId, { force: true })
+        : this.ensureAccountStyle(accountId);
+      styleWork
         .catch((error) => this.publish("error", { accountId, message: `账号风格学习失败：${error.message}` }));
       if (this.store.getAccountAutomation(accountId).enabled) {
         this.catchUpRecentInbound(accountId).catch((error) => {
@@ -689,6 +725,12 @@ class SalesService extends EventEmitter {
   }
 
   queueSnapshot(accountId) {
+    this.store.recoverProcessingMessages({
+      accountId,
+      activeKeys: this.processingMessages,
+      fallbackState: "queued",
+      resetAutomation: false
+    });
     const raw = this.store.listQueuedMessages(accountId);
     const grouped = new Map();
     for (const message of raw) {
@@ -710,10 +752,13 @@ class SalesService extends EventEmitter {
           preview: message.body || (message.type === "image" ? "[图片]" : `[${message.type}]`),
           type: message.type,
           createdAt: message.createdAt,
+          queuePriority: messageQueuePriority(message),
+          queueSource: message.metadata?.queueSource || "existing",
+          queuedAt: Number(message.metadata?.queuedAt || message.createdAt || 0),
           messageCount
         };
       })
-      .sort((a, b) => a.createdAt - b.createdAt);
+      .sort((a, b) => a.queuePriority - b.queuePriority || a.queuedAt - b.queuedAt || a.createdAt - b.createdAt);
     const automation = this.store.getAccountAutomation(accountId);
     const waitingItems = automation.current ? items.filter((item) => item.id !== automation.current.id) : items;
     return {
@@ -732,11 +777,32 @@ class SalesService extends EventEmitter {
     return automation;
   }
 
-  queueMessage(message, reason = "等待账号 AI 开关开启") {
+  queueMessage(message, reason = "等待账号 AI 开关开启", options = {}) {
     if (isManosMarker(message)) return this.updateAutomation(message, "ignored", { automationSource: "lead-marker", automationReason: "广告来源标记已保留，等待客户实际问题" });
+    const linkedQuote = this.store.getQuoteByInboundMessage(message.chatId, message.id);
+    if (linkedQuote && ["pending", "approved"].includes(linkedQuote.status)) {
+      if (message.metadata?.automationState === "quote_pending") return message;
+      return this.updateAutomation(message, "quote_pending", {
+        automationReason: "报价仍在等待审核",
+        automationSource: "quote-review"
+      });
+    }
+    if (linkedQuote && ["sent", "rejected"].includes(linkedQuote.status)) {
+      return this.updateAutomation(message, "replied", {
+        automationReason: "该商品报价已经人工处理",
+        automationSource: "quote-review"
+      });
+    }
+    const queueSource = options.source || message.metadata?.queueSource || (message.status === "history" ? "history-sync" : "live");
+    const requestedPriority = Number(options.priority);
+    const queuePriority = Number.isFinite(requestedPriority)
+      ? requestedPriority
+      : messageQueuePriority(message, defaultQueuePriority(message, queueSource));
     const updated = this.updateAutomation(message, "queued", {
       automationReason: reason,
       automationSource: "account-queue",
+      queueSource,
+      queuePriority,
       queuedAt: message.metadata?.queuedAt || Date.now()
     });
     this.publishAccountQueue(message.accountId);
@@ -746,7 +812,34 @@ class SalesService extends EventEmitter {
   prepareNextQueuedMessage(accountId) {
     const queued = this.store.listQueuedMessages(accountId);
     for (const message of queued) if (isManosMarker(message)) this.queueMessage(message);
-    const raw = queued.filter(message => !isManosMarker(message));
+    const raw = [];
+    for (const message of queued) {
+      if (isManosMarker(message)) continue;
+      const quote = this.store.getQuoteByInboundMessage(message.chatId, message.id);
+      if (quote && ["pending", "approved"].includes(quote.status)) {
+        this.updateAutomation(message, "quote_pending", {
+          automationReason: "报价仍在等待审核",
+          automationSource: "quote-review"
+        });
+        continue;
+      }
+      if (quote && ["sent", "rejected"].includes(quote.status)) {
+        this.updateAutomation(message, "replied", {
+          automationReason: "该商品报价已经人工处理",
+          automationSource: "quote-review"
+        });
+        continue;
+      }
+      const contact = this.store.getContact(message.chatId);
+      if (contact?.mode === "human" || (contact?.needsHuman && contact.handoffMessageId === message.id)) {
+        this.updateAutomation(message, "handoff", {
+          automationReason: contact.escalationReason || "当前节点等待人工处理",
+          automationSource: "human-handoff"
+        });
+        continue;
+      }
+      raw.push(message);
+    }
     const latestTextByChat = new Map();
     const candidates = [];
     for (const message of raw) {
@@ -775,7 +868,7 @@ class SalesService extends EventEmitter {
         latestTextByChat.delete(message.chatId);
       }
     }
-    return [...candidates, ...latestTextByChat.values()].sort((a, b) => a.createdAt - b.createdAt)[0] || null;
+    return [...candidates, ...latestTextByChat.values()].sort(compareQueuedMessages)[0] || null;
   }
 
   async runAccountQueue(accountId) {
@@ -813,7 +906,10 @@ class SalesService extends EventEmitter {
           this.store.updateAccountAutomation(id, { lastProcessedAt: Date.now(), lastContactName: current.contactName, lastError: "" });
         } catch (error) {
           if (!this.accountIsReady(id)) {
-            this.queueMessage(message, "连接已断开，恢复后自动继续");
+            this.queueMessage(message, "连接已断开，恢复后自动继续", {
+              source: message.metadata?.queueSource,
+              priority: message.metadata?.queuePriority
+            });
             break;
           }
           this.store.updateAccountAutomation(id, { lastError: error.message });
@@ -888,7 +984,8 @@ class SalesService extends EventEmitter {
     const job = (async () => {
       this.styleProgress(id, { status: "analyzing", progress: 8, progressLabel: "正在整理该账号的历史回复…", error: "", analysisWarning: "" });
       const samples = this.store.listAccountOutbound(id, 300);
-      this.styleProgress(id, { status: "analyzing", progress: 32, progressLabel: `已提取 ${samples.length} 条历史回复，正在分析表达习惯…`, sampleCount: samples.length });
+      const pairedSamples = samples.filter((sample) => sample.customerBody).length;
+      this.styleProgress(id, { status: "analyzing", progress: 32, progressLabel: `清洗后保留 ${samples.length} 条本人回复，其中 ${pairedSamples} 条带客户上下文…`, sampleCount: samples.length });
       if (!samples.length) {
         return this.styleProgress(id, {
           status: "needs_input",
@@ -900,7 +997,7 @@ class SalesService extends EventEmitter {
           analysisMethod: ""
         });
       }
-      this.styleProgress(id, { status: "analyzing", progress: 58, progressLabel: "正在统计整批样本并分析代表性回复，CPU 模式可能需要数分钟…" });
+      this.styleProgress(id, { status: "analyzing", progress: 58, progressLabel: "正在理解客户场景、表达习惯和销售节奏…" });
       const analyzed = await this.ai.analyzeStyle(samples);
       this.styleProgress(id, { status: "analyzing", progress: 88, progressLabel: "正在生成可编辑的风格规则…" });
       const preservedManualRules = (this.store.getAccountStyle(id).rules || []).filter((rule) => rule.source === "manual");
@@ -917,6 +1014,8 @@ class SalesService extends EventEmitter {
         rules: [...preservedManualRules, ...analysisRules],
         sampleCount: analyzed.sampleCount,
         modelSampleCount,
+        styleExamples: analyzed.styleExamples || [],
+        analysisVersion: STYLE_ANALYSIS_VERSION,
         analysisMethod: statistical ? "statistics" : "model",
         analysisWarning: analyzed.warning || "",
         error: "",
@@ -948,6 +1047,7 @@ class SalesService extends EventEmitter {
       status: summary ? "ready" : "needs_input",
       progress: 100,
       progressLabel: summary ? "人工编辑的语言风格已生效" : "请填写语言风格描述",
+      analysisVersion: STYLE_ANALYSIS_VERSION,
       analysisMethod: "manual",
       analysisWarning: "",
       error: "",
@@ -1017,6 +1117,7 @@ class SalesService extends EventEmitter {
         summary: agent.summary || "",
         rules: agent.rules || [],
         persona: agent.persona || {},
+        styleExamples: agent.styleExamples || [],
         sampleCount: Number(agent.sampleCount || 0),
         progress: Number(agent.progress || 0),
         progressLabel: agent.progressLabel || "",
@@ -1087,6 +1188,7 @@ class SalesService extends EventEmitter {
       summary: source.summary,
       rules: source.rules,
       persona: source.persona,
+      styleExamples: source.styleExamples,
       sampleCount: source.sampleCount,
       progress: source.progress,
       progressLabel: source.progressLabel,
@@ -1378,6 +1480,10 @@ class SalesService extends EventEmitter {
   }
 
   async ingest(message) {
+    if (isSpamMessage(message)) {
+      this.publish("message-ignored", { accountId: message.accountId, reason: "疑似冒充 WhatsApp 的账号验证垃圾消息" });
+      return { inserted: false, ignored: true, reason: "spam-message" };
+    }
     if (isSystemConversation(message)) {
       this.publish("message-ignored", { accountId: message.accountId, reason: "WhatsApp 官方或系统消息" });
       return { inserted: false, ignored: true, reason: "system-message" };
@@ -1394,9 +1500,11 @@ class SalesService extends EventEmitter {
     const result = this.store.addMessage({ ...message, chatId: conversationId, providerChatId, direction: "inbound", status: "received" });
     if (!result.inserted && (!result.message || result.message.metadata?.automationState)) return result;
     this.publish("message", { chatId: conversationId, accountId: message.accountId, message: result.message });
-    let queuedMessage = result.message;
+    let queuedMessage = this.queueMessage(result.message, this.store.getAccountAutomation(message.accountId).enabled ? "实时消息已进入优先回复队列" : "账号 AI 回复已关闭", {
+      source: "live",
+      priority: defaultQueuePriority(result.message, "live")
+    }) || result.message;
     if (["image", "video"].includes(message.type) && message.media?.data) queuedMessage = this.cacheInboundMedia(queuedMessage, message.media);
-    this.queueMessage(queuedMessage, this.store.getAccountAutomation(message.accountId).enabled ? "等待按账号顺序回复" : "账号 AI 回复已关闭");
     this.scheduleConversationMemory(conversationId);
     if (this.store.getAccountAutomation(message.accountId).enabled) await this.runAccountQueue(message.accountId);
     return result;
@@ -1452,6 +1560,8 @@ class SalesService extends EventEmitter {
   }
 
   async processAndRecord(message, media, mediaError = "", options = {}) {
+    const processingKey = `${message.chatId}::${message.id}`;
+    this.processingMessages.add(processingKey);
     this.updateAutomation(message, "processing", { automationReason: options.catchUp ? "断线后补回复" : "" });
     try {
       const result = await this.process(message, media, mediaError, options) || { state: "ignored", reason: "无需自动处理" };
@@ -1473,6 +1583,14 @@ class SalesService extends EventEmitter {
     } catch (error) {
       this.updateAutomation(message, "failed", { automationReason: error.message });
       throw error;
+    } finally {
+      this.processingMessages.delete(processingKey);
+      this.store.recoverProcessingMessages({
+        accountId: message.accountId,
+        activeKeys: this.processingMessages,
+        fallbackState: "queued",
+        resetAutomation: false
+      });
     }
   }
 
@@ -1538,60 +1656,27 @@ class SalesService extends EventEmitter {
       });
       return { state: "replied", source: "identity-policy", reason: "按客服身份规则继续接待客户" };
     }
-    const configuredStyle = this.store.getAccountStyle(message.accountId);
-    const careReply = customerCareReply(message.body, configuredStyle);
-    if (careReply) {
-      if (this.store.hasLaterOutbound(message.chatId, message.createdAt, message.id)) {
-        return { state: "superseded", reason: "人工已经回复，本次闲聊关怀已取消" };
-      }
-      await this.sendText(message.chatId, careReply, {
-        source: "customer-care",
-        replyToId: message.id,
-        metadata: { deterministic: true, personaAware: true }
-      });
-      return { state: "replied", source: "customer-care", reason: "已根据账号性格直接回应客户的闲聊内容" };
-    }
     const intent = manualKnowledgeIntent(message.body);
     const learnedReplies = isPriceQuestion(message.body) ? [] : this.store.findLearnedReplies(message.accountId, message.body, intent);
-    const trigger = HUMAN_TRIGGERS.find((item) => !item.alwaysHuman && item.pattern.test(message.body));
-    if (trigger && !learnedReplies.length) {
-      this.store.requestHuman(message.chatId, trigger.reason, message.id);
-      this.publish("handoff", { chatId: message.chatId, reason: trigger.reason });
-      return { state: "handoff", reason: trigger.reason };
-    }
-    if (isAlbumFollowUp(message, context)) {
-      await this.sendText(message.chatId, MANOS_ALBUM_FOLLOW_UP, {
-        source: "album-follow-up",
-        replyToId: message.id,
-        metadata: { deterministic: true, contextCount: context.length }
-      });
-      return { state: "replied", source: "album-follow-up", reason: "客户确认立即查看相册" };
-    }
     if (isSizeQuestion(message.body)) {
       const sizeReply = await this.replyFromSupplierFacts(message);
       if (sizeReply) return { state: "replied", source: "supplier-specification", reason: "已从多个相似微店货源描述归集尺寸并专业回复" };
     }
-    const accountStyle = await this.ensureAccountStyle(message.accountId);
-    if (accountStyle.status !== "ready" || !accountStyle.summary) {
-      const reason = "服务账号的语言风格尚未完成，请先在 AI 页面确认或填写";
-      this.store.requestHuman(message.chatId, reason, message.id);
-      this.publish("handoff", { chatId: message.chatId, accountId: message.accountId, reason });
-      return { state: "handoff", reason };
-    }
+    const accountStyle = this.store.getAccountStyle(message.accountId);
     if (isCasualMessage(message.body)) {
       const contextualReply = prefersContextualCasualReply(message.body);
       let generatedByLocalModel = false;
-      let casualReply = contextualReply ? casualFallbackReply(message.body, accountStyle, context) : "";
-      if (!casualReply) {
-        try {
-          casualReply = await this.ai.casualReply(message.body, accountStyle, [...this.memoryContextForAI(message.chatId, 8), ...context]);
-          generatedByLocalModel = Boolean(casualReply);
-        } catch (error) {
-          casualReply = "";
-        }
+      let casualReply = "";
+      try {
+        casualReply = await this.ai.casualReply(message.body, accountStyle, [...this.memoryContextForAI(message.chatId, 8), ...context]);
+        generatedByLocalModel = Boolean(casualReply);
+      } catch (error) {
+        casualReply = "";
       }
       if (!casualReply) {
-        casualReply = casualFallbackReply(message.body, accountStyle, context);
+        casualReply = contextualReply
+          ? casualFallbackReply(message.body, accountStyle, context)
+          : customerCareReply(message.body, accountStyle) || casualFallbackReply(message.body, accountStyle, context);
       }
       if (this.store.hasLaterOutbound(message.chatId, message.createdAt, message.id)) {
         return { state: "superseded", reason: "人工已经回复，本次闲聊关怀已取消" };
@@ -1599,7 +1684,7 @@ class SalesService extends EventEmitter {
       await this.sendText(message.chatId, casualReply, {
         source: "customer-care",
         replyToId: message.id,
-        metadata: { personaAware: true, generatedByLocalModel, contextualReply: !generatedByLocalModel }
+        metadata: { personaAware: true, generatedByLocalModel, fallback: !generatedByLocalModel }
       });
       if (isCallRequest(message.body)) {
         const reason = "客户希望电话或视频通话，需要人工确认时间";
@@ -1609,27 +1694,14 @@ class SalesService extends EventEmitter {
       }
       return { state: "replied", source: "customer-care", reason: "本地模型已按账号性格回应客户闲聊" };
     }
-    const ruleReply = answerFromManualRules(message.body, accountStyle);
-    if (ruleReply) {
-      if (this.store.hasLaterOutbound(message.chatId, message.createdAt, message.id)) {
-        return { state: "superseded", reason: "人工已经回复，本次账号规则回复已取消" };
-      }
-      await this.sendText(message.chatId, ruleReply, {
-        source: "account-rule",
-        replyToId: message.id,
-        metadata: { deterministic: true, ruleGrounded: true }
-      });
-      return { state: "replied", source: "account-rule", reason: "直接使用人工确认的账号业务规则" };
+    const learnedAccountStyle = await this.ensureAccountStyle(message.accountId);
+    if (learnedAccountStyle.status !== "ready" || !learnedAccountStyle.summary) {
+      const reason = "服务账号的语言风格尚未完成，请先在 AI 页面确认或填写";
+      this.store.requestHuman(message.chatId, reason, message.id);
+      this.publish("handoff", { chatId: message.chatId, accountId: message.accountId, reason });
+      return { state: "handoff", reason };
     }
-    const trustedLearnedReply = learnedReplies.find((item) => item.score >= 4);
-    if (trustedLearnedReply) {
-      await this.sendText(message.chatId, trustedLearnedReply.answer, {
-        source: "human-memory",
-        replyToId: message.id,
-        metadata: { learnedReplyId: trustedLearnedReply.id, learnedScore: trustedLearnedReply.score }
-      });
-      return { state: "replied", source: "human-memory", reason: "复用此前人工确认的相似问答" };
-    }
+    Object.assign(accountStyle, learnedAccountStyle);
     let decision;
     let usedCustomerMemoryIds = [];
     try {
@@ -1655,6 +1727,54 @@ class SalesService extends EventEmitter {
       this.store.requestHuman(message.chatId, reason, message.id);
       this.publish("handoff", { chatId: message.chatId, reason });
       return { state: "handoff", reason };
+    }
+    if (decision.action === "send_catalog" && decision.confidence >= 0.65) {
+      if (this.store.hasLaterOutbound(message.chatId, message.createdAt, message.id)) {
+        return { state: "superseded", reason: "人工已经回复，本次 AI 相册发送已取消" };
+      }
+      const introduction = String(decision.reply || "").trim();
+      const catalogReply = /manos\.live|manos-world\.com|linktr\.ee\/ManosVip/i.test(introduction)
+        ? introduction
+        : introduction ? `${introduction}\n\n${MANOS_ALBUM_LINKS}` : MANOS_ALBUM_FOLLOW_UP;
+      await this.sendText(message.chatId, catalogReply, {
+        source: "ai-catalog",
+        replyToId: message.id,
+        metadata: {
+          confidence: decision.confidence,
+          reason: decision.reason,
+          contextCount: context.length,
+          decidedByAI: true
+        }
+      });
+      return { state: "replied", source: "ai-catalog", reason: decision.reason || "AI 判断客户需要商品相册" };
+    }
+    if (decision.action === "reply_and_handoff" && decision.confidence >= 0.65 && decision.reply) {
+      if (this.store.hasLaterOutbound(message.chatId, message.createdAt, message.id)) {
+        return { state: "superseded", reason: "人工已经回复，本次 AI 待办回应已取消" };
+      }
+      const task = String(decision.task || decision.reason || "客户请求需要人工继续处理").trim().slice(0, 160);
+      await this.sendText(message.chatId, decision.reply, {
+        source: "ai-task-acknowledgement",
+        replyToId: message.id,
+        metadata: {
+          confidence: decision.confidence,
+          reason: decision.reason,
+          createsHumanTask: true,
+          handoffReason: task,
+          contextCount: context.length,
+          learnedReplyIds: learnedReplies.map((item) => item.id),
+          customerMemoryIds: usedCustomerMemoryIds
+        }
+      });
+      this.store.requestHuman(message.chatId, task, message.id);
+      this.publish("handoff", {
+        chatId: message.chatId,
+        accountId: message.accountId,
+        reason: task,
+        acknowledged: true,
+        decidedByAI: true
+      });
+      return { state: "handoff", source: "ai-task-router", reason: `${task}；已先自然回应客户` };
     }
     if (decision.action !== "reply" || decision.confidence < 0.65 || !decision.reply) {
       const reason = decision.reason || "AI 置信度不足";
@@ -1688,7 +1808,10 @@ class SalesService extends EventEmitter {
         return (!chatId || message.chatId === chatId) && contact && !contact.isSystem && !isSystemConversation(contact) && contact.mode === "auto";
       });
     for (const message of candidates) {
-      this.queueMessage(message, "断线期间的新消息已加入账号队列");
+      this.queueMessage(message, "历史同步消息已加入低优先级补回队列", {
+        source: "history-sync",
+        priority: defaultQueuePriority(message, "history-sync")
+      });
     }
     await this.runAccountQueue(accountId);
     if (candidates.length) this.publish("catch-up", { accountId, count: candidates.length });
@@ -2663,7 +2786,8 @@ class SalesService extends EventEmitter {
       return {
         ...account,
         style: this.store.getAccountStyle(account.accountId),
-        automation: this.queueSnapshot(account.accountId)
+        automation: this.queueSnapshot(account.accountId),
+        inbox: this.store.stats([account.accountId])
       };
     });
     return {

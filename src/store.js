@@ -1,7 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const { randomUUID } = require("crypto");
-const { MANOS_LEAD_WELCOME, isSystemConversation, isSystemNotice, isManosMarker } = require("./message-policy");
+const { MANOS_LEAD_WELCOME, isSystemConversation, isSystemNotice, isSpamMessage, isManosMarker } = require("./message-policy");
 const { MysqlStateDatabase } = require("./database");
 const { TestStateDatabase } = require("./test-state-database");
 const { DatabaseRemoteAuthStore } = require("./database-auth-store");
@@ -132,6 +132,8 @@ function defaultAccountStyle(accountId) {
     persona: defaultAccountPersona(),
     sampleCount: 0,
     modelSampleCount: 0,
+    styleExamples: [],
+    analysisVersion: 0,
     analysisMethod: "",
     analysisWarning: "",
     progress: 0,
@@ -165,6 +167,15 @@ function normalizeAccountStyle(current, patch = {}, accountId = "") {
     persona.completed = Boolean(persona.gender && persona.business && persona.tone && persona.personality);
     persona.updatedAt = Date.now();
     next.persona = persona;
+  }
+  if (patch.styleExamples !== undefined) {
+    next.styleExamples = (Array.isArray(patch.styleExamples) ? patch.styleExamples : [])
+      .map((example) => ({
+        customer: String(example?.customer || "").trim().slice(0, 600),
+        reply: String(example?.reply || "").trim().slice(0, 800)
+      }))
+      .filter((example) => example.customer && example.reply)
+      .slice(0, 24);
   }
   next.welcomeFlow = normalizeWelcomeFlow(
     patch.welcomeFlow !== undefined ? patch.welcomeFlow : next.welcomeFlow,
@@ -231,6 +242,48 @@ function isMediaPlaceholder(value) {
   return /^\s*(?:\[(?:客户发送|历史|发送)?(?:图片|视频|image|video)\]|(?:图片|视频|image|video))\s*$/i.test(String(value || ""));
 }
 
+function queuedMessagePriority(message) {
+  const value = Number(message?.metadata?.queuePriority);
+  return Number.isFinite(value) ? value : 10;
+}
+
+function directionFromMessageId(value) {
+  const id = String(value || "");
+  if (/^true_/i.test(id) || /"fromMe"\s*:\s*true/i.test(id)) return "outbound";
+  if (/^false_/i.test(id) || /"fromMe"\s*:\s*false/i.test(id)) return "inbound";
+  return "";
+}
+
+function normalizedMessageDirection(message = {}) {
+  return directionFromMessageId(message.id) || (message.direction === "outbound" ? "outbound" : "inbound");
+}
+
+function styleSampleText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function isUsefulStyleSample(message = {}) {
+  const body = styleSampleText(message.body);
+  if (!body || !["text", "chat", ""].includes(String(message.type || ""))) return false;
+  if (body.length < 3 || body.length > 2400) return false;
+  if (isMediaPlaceholder(body) || /^\[(?:revoked|deleted|removed|撤回|已删除|消息).*\]$/i.test(body)) return false;
+  if (/^\s*(?:\d+(?:[.,]\d+)?|[^\p{L}\p{N}]+)\s*$/u.test(body)) return false;
+  if (/ManosID\s*--/i.test(body)) return false;
+  if (/\b(?:IBAN|SWIFT|BIC|sort\s*code|account\s*(?:name|number)|bank\s*(?:name|address|account)|wire\s*transfer)\b/i.test(body)) return false;
+  if (/manos\.live|manos-world\.com|linktr\.ee\/ManosVip|here are some of our photo albums/i.test(body)) return false;
+  if (/^(?:https?:\/\/|www\.)\S+$/i.test(body)) return false;
+  return true;
+}
+
+function styleSampleKey(value) {
+  return styleSampleText(value)
+    .toLowerCase()
+    .replace(/https?:\/\/\S+|www\.\S+/g, "<url>")
+    .replace(/\d+(?:[.,]\d+)?/g, "#")
+    .replace(/[^\p{L}\p{N}#<>]+/gu, " ")
+    .trim();
+}
+
 class Store {
   constructor(dataDir, options = {}) {
     this.dataDir = path.resolve(dataDir);
@@ -251,6 +304,59 @@ class Store {
       }), dataDir: this.dataDir }));
     this.state = this.load();
     this.repairSystemNotices();
+    this.repairSpamMessages();
+  }
+
+  repairSpamMessages() {
+    const spam = this.state.messages.filter((message) => message.direction !== "outbound" && isSpamMessage(message));
+    if (!spam.length) return;
+    const spamKeys = new Set(spam.map((row) => `${row.chatId}::${row.id}`));
+    const spamChats = new Set(spam.map((row) => row.chatId));
+    this.state.messages = this.state.messages.filter((row) => !spamKeys.has(`${row.chatId}::${row.id}`));
+    const removedQuoteIds = new Set(this.state.quotes
+      .filter((quote) => spamKeys.has(`${quote.chatId}::${quote.inboundMessageId}`))
+      .map((quote) => quote.id));
+    this.state.quotes = this.state.quotes.filter((quote) => !removedQuoteIds.has(quote.id));
+    if (removedQuoteIds.size) {
+      const remainingQuoteIds = new Set(this.state.quotes.map((quote) => quote.id));
+      for (const quote of this.state.quotes) {
+        if (!(quote.quotationGroupQuoteIds || []).some((id) => removedQuoteIds.has(id))) continue;
+        quote.quotationGroupQuoteIds = (quote.quotationGroupQuoteIds || []).filter((id) => remainingQuoteIds.has(id));
+        quote.quotationItemCount = Math.max(1, quote.quotationGroupQuoteIds.length);
+        quote.quotationMediaUrl = "";
+        quote.quotationFilename = "";
+        quote.quotationGeneratedAt = 0;
+        quote.updatedAt = Date.now();
+      }
+    }
+    this.state.learnedReplies = this.state.learnedReplies.filter((row) => !spamKeys.has(`${row.chatId}::${row.sourceMessageId}`));
+    this.state.customerMemories = this.state.customerMemories.filter((row) => !spamKeys.has(`${row.chatId}::${row.sourceMessageId}`));
+
+    for (const chatId of spamChats) {
+      const contact = this.state.contacts[chatId];
+      if (!contact) continue;
+      const remainingMessages = this.state.messages.filter((row) => row.chatId === chatId);
+      const hasCustomerMessage = remainingMessages.some((row) => row.direction !== "outbound");
+      const hasHumanReply = remainingMessages.some((row) => row.direction === "outbound" && (!row.metadata?.source || row.metadata.source === "human"));
+      if (!hasCustomerMessage && !hasHumanReply && !contact.isDemo) {
+        this.state.messages = this.state.messages.filter((row) => row.chatId !== chatId);
+        this.state.quotes = this.state.quotes.filter((quote) => quote.chatId !== chatId);
+        delete this.state.contacts[chatId];
+        delete this.state.conversationMemories[chatId];
+        continue;
+      }
+      const latest = remainingMessages.sort((a, b) => Number(b.createdAt || 0) - Number(a.createdAt || 0))[0];
+      contact.lastMessagePreview = latest?.body || "";
+      contact.lastMessageAt = latest?.createdAt || 0;
+      contact.unread = Math.max(0, Number(contact.unread || 0) - spam.filter((row) => row.chatId === chatId && row.status !== "history").length);
+      if (spamKeys.has(`${chatId}::${contact.handoffMessageId}`)) {
+        contact.needsHuman = false;
+        contact.escalationReason = "";
+        contact.handoffMessageId = "";
+      }
+      contact.updatedAt = Date.now();
+    }
+    this.save();
   }
 
   repairSystemNotices() {
@@ -578,14 +684,16 @@ class Store {
   }
 
   importHistory(chatId, profileName, messages, unread = 0) {
+    const accepted = (messages || []).filter((message) => !isSpamMessage(message));
+    if (!accepted.length) return 0;
     let inserted = 0;
     this.batch(() => {
       this.upsertContact(chatId, { profileName: profileName || chatId });
-      for (const message of messages || []) {
+      for (const message of accepted) {
         const result = this.addMessage({ ...message, chatId, status: "history" });
         if (result.inserted) inserted += 1;
       }
-      this.upsertContact(chatId, { unread: number(unread) });
+      this.upsertContact(chatId, { unread: Math.min(number(unread), accepted.filter((message) => normalizedMessageDirection(message) === "inbound").length) });
     });
     return inserted;
   }
@@ -726,13 +834,14 @@ class Store {
   }
 
   addMessage(message) {
-    if (isSystemNotice(message)) return { inserted: false, ignored: true, message: null };
+    if (isSystemNotice(message) || isSpamMessage(message)) return { inserted: false, ignored: true, message: null };
     const id = String(message.id || `local-${Date.now()}-${Math.random().toString(16).slice(2)}`);
     const chatId = String(message.chatId || "");
+    const direction = normalizedMessageDirection({ ...message, id });
     const duplicate = this.state.messages.find((item) => item.id === id && item.chatId === chatId);
     if (duplicate) {
       const mediaPatch = {
-        direction: message.direction === "outbound" ? "outbound" : "inbound",
+        direction,
         type: message.type || duplicate.type,
         body: String(message.body || duplicate.body || ""),
         accountId: String(message.accountId || duplicate.accountId || "primary"),
@@ -753,13 +862,13 @@ class Store {
       accountId: String(message.accountId || "primary"),
       accountName: String(message.accountName || "主账号"),
       providerChatId: String(message.providerChatId || providerChatIdFrom(message.chatId)),
-      direction: message.direction === "outbound" ? "outbound" : "inbound",
+      direction,
       type: message.type || "text",
       body: String(message.body || ""),
       mediaUrl: String(message.mediaUrl || ""),
       localMediaPath: String(message.localMediaPath || ""),
       mimeType: String(message.mimeType || ""),
-      status: message.status || (message.direction === "outbound" ? "sent" : "received"),
+      status: message.status || (direction === "outbound" ? "sent" : "received"),
       replyToId: String(message.replyToId || ""),
       metadata: message.metadata || {},
       createdAt: number(message.createdAt, now),
@@ -810,7 +919,7 @@ class Store {
 
   getLatestMessage(chatId) {
     const row = this.state.messages
-      .filter((item) => item.chatId === String(chatId) && !isSystemNotice(item))
+      .filter((item) => item.chatId === String(chatId) && !isSystemNotice(item) && !isSpamMessage(item))
       .sort((a, b) => b.createdAt - a.createdAt)[0];
     return row ? { ...row, metadata: { ...(row.metadata || {}) } } : null;
   }
@@ -1052,10 +1161,13 @@ class Store {
       .filter((message) => message.direction === "inbound"
         && message.createdAt >= number(cutoff)
         && ["text", "image", "video"].includes(message.type)
+        && !this.state.quotes.some((quote) => quote.chatId === message.chatId && quote.inboundMessageId === message.id)
         && (!message.metadata?.automationState || (message.metadata.automationState === "superseded"
           && message.metadata.automationReason === "已合并到该客户更新的消息中"
           && this.state.messages.some(item => item.chatId === message.chatId && item.createdAt >= message.createdAt && isManosMarker(item)))))
-      .sort((a, b) => a.createdAt - b.createdAt)
+      .sort((a, b) => queuedMessagePriority(a) - queuedMessagePriority(b)
+        || number(a.metadata?.queuedAt, a.createdAt) - number(b.metadata?.queuedAt, b.createdAt)
+        || a.createdAt - b.createdAt)
       .map((message) => ({ ...message, metadata: { ...(message.metadata || {}) } }));
   }
 
@@ -1089,23 +1201,37 @@ class Store {
     const id = String(accountId || "");
     const max = Math.min(Math.max(number(limit, 240), 20), 500);
     const seen = new Set();
-    return this.state.messages
-      .filter((item) => item.direction === "outbound"
-        && !isSystemNotice(item)
-        && (item.accountId === id || item.chatId.startsWith(`${id}::`))
-        && item.body.trim()
-        && !/ManosID\s*--/i.test(item.body)
-        && (!item.metadata?.source || item.metadata.source === "human"))
-      .sort((a, b) => b.createdAt - a.createdAt)
-      .filter((item) => {
-        const key = item.body.trim().toLowerCase();
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      })
-      .slice(0, max)
-      .reverse()
-      .map((item) => ({ ...item }));
+    const messages = this.state.messages
+      .filter((item) => item.accountId === id || item.chatId.startsWith(`${id}::`))
+      .sort((a, b) => a.createdAt - b.createdAt);
+    const lastCustomerByChat = new Map();
+    const samples = [];
+    for (const item of messages) {
+      const direction = directionFromMessageId(item.id) || item.direction;
+      if (direction === "inbound") {
+        if (["text", "chat"].includes(String(item.type || "text")) && !isSystemNotice(item) && !isMediaPlaceholder(item.body)) {
+          lastCustomerByChat.set(item.chatId, item);
+        }
+        continue;
+      }
+      if (direction !== "outbound"
+        || isSystemNotice(item)
+        || !isUsefulStyleSample(item)
+        || (item.metadata?.source && item.metadata.source !== "human")) continue;
+      const key = styleSampleKey(item.body);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      const customer = lastCustomerByChat.get(item.chatId);
+      const closeEnough = customer && item.createdAt >= customer.createdAt && item.createdAt - customer.createdAt <= 14 * 24 * 60 * 60 * 1000;
+      samples.push({
+        ...item,
+        direction: "outbound",
+        body: styleSampleText(item.body),
+        customerBody: closeEnough ? styleSampleText(customer.body).slice(0, 1200) : "",
+        customerMessageId: closeEnough ? customer.id : ""
+      });
+    }
+    return samples.slice(-max).map((item) => ({ ...item, metadata: { ...(item.metadata || {}) } }));
   }
 
   getAccountStyle(accountId) {
@@ -1121,6 +1247,7 @@ class Store {
       accountId: id,
       persona: { ...fallback.persona, ...(source.persona || {}) },
       rules: (source.rules || []).map((rule) => ({ ...rule })),
+      styleExamples: (source.styleExamples || []).map((example) => ({ ...example })),
       welcomeFlow: normalizeWelcomeFlow(source.welcomeFlow, fallback.welcomeFlow)
     } : fallback;
     if (agent) {
@@ -1271,20 +1398,47 @@ class Store {
     return this.getAccountAutomation(id);
   }
 
-  recoverProcessingMessages() {
+  recoverProcessingMessages(options = {}) {
+    const accountId = String(options.accountId || "");
+    const activeKeys = options.activeKeys instanceof Set
+      ? options.activeKeys
+      : new Set(Array.isArray(options.activeKeys) ? options.activeKeys.map(String) : []);
+    const fallbackState = options.fallbackState === "failed" ? "failed" : "queued";
     let changed = false;
     this.batch(() => {
       for (const message of this.state.messages) {
         if (message.metadata?.automationState !== "processing") continue;
-        message.metadata = { ...message.metadata, automationState: "queued", automationReason: "服务重启后重新排队" };
+        if (accountId && !(message.accountId === accountId || message.chatId.startsWith(`${accountId}::`))) continue;
+        if (activeKeys.has(`${message.chatId}::${message.id}`)) continue;
+        const directReply = this.state.messages.find((item) => item.chatId === message.chatId
+          && item.direction === "outbound"
+          && item.replyToId === message.id);
+        const contact = this.state.contacts[message.chatId];
+        const handedOff = Boolean(contact?.needsHuman && contact.handoffMessageId === message.id);
+        const laterReply = !directReply && this.state.messages.some((item) => item.chatId === message.chatId
+          && item.direction === "outbound"
+          && item.createdAt > message.createdAt);
+        const automationState = handedOff ? "handoff" : directReply ? "replied" : laterReply ? "superseded" : fallbackState;
+        const automationReason = handedOff
+          ? (contact.escalationReason || "当前问题已转人工")
+          : directReply
+            ? "检测到已发送的对应回复，已自动修复处理状态"
+            : laterReply
+              ? "该消息之后已有回复，已自动修复处理状态"
+              : fallbackState === "failed" ? "回复任务意外中断，请重试" : "回复任务意外中断，已重新排队";
+        message.metadata = { ...message.metadata, automationState, automationReason, automationAt: Date.now() };
         message.updatedAt = Date.now();
         changed = true;
       }
-      for (const automation of Object.values(this.state.accountAutomation)) {
-        if (automation.current || automation.status === "running") changed = true;
-        automation.current = null;
-        automation.status = automation.enabled ? "idle" : "off";
-        automation.updatedAt = Date.now();
+      if (options.resetAutomation !== false) {
+        for (const [id, automation] of Object.entries(this.state.accountAutomation)) {
+          if (accountId && id !== accountId) continue;
+          if (automation.current && activeKeys.has(`${automation.current.chatId}::${automation.current.id}`)) continue;
+          if (automation.current || automation.status === "running") changed = true;
+          automation.current = null;
+          automation.status = automation.enabled ? "idle" : "off";
+          automation.updatedAt = Date.now();
+        }
       }
       if (changed) this.save();
     });
@@ -1297,9 +1451,12 @@ class Store {
       .filter((message) => (message.accountId === id || message.chatId.startsWith(`${id}::`))
         && message.direction === "inbound"
         && !isSystemNotice(message)
+        && !isSpamMessage(message)
         && message.metadata?.automationState === "queued"
         && !isSystemConversation(this.state.contacts[message.chatId] || message))
-      .sort((a, b) => a.createdAt - b.createdAt)
+      .sort((a, b) => queuedMessagePriority(a) - queuedMessagePriority(b)
+        || number(a.metadata?.queuedAt, a.createdAt) - number(b.metadata?.queuedAt, b.createdAt)
+        || a.createdAt - b.createdAt)
       .map((message) => ({ ...message, metadata: { ...(message.metadata || {}) } }));
   }
 
@@ -1307,7 +1464,7 @@ class Store {
     const limit = Math.min(Math.max(number(options.limit, 100), 1), 500);
     const before = number(options.before, Number.MAX_SAFE_INTEGER);
     const rows = this.state.messages
-      .filter((item) => item.chatId === String(chatId) && item.createdAt < before && !isSystemNotice(item))
+      .filter((item) => item.chatId === String(chatId) && item.createdAt < before && !isSystemNotice(item) && !isSpamMessage(item))
       .sort((a, b) => b.createdAt - a.createdAt)
       .slice(0, limit)
       .reverse();
@@ -1325,7 +1482,7 @@ class Store {
   getContext(chatId, currentText = "") {
     const limit = Math.min(Math.max(number(this.state.settings.contextMessageLimit, 60), 10), 200);
     const all = this.state.messages
-      .filter((item) => item.chatId === String(chatId) && ["text", "image"].includes(item.type) && !isManosMarker(item))
+      .filter((item) => item.chatId === String(chatId) && ["text", "image"].includes(item.type) && !isManosMarker(item) && !isSpamMessage(item))
       .sort((a, b) => a.createdAt - b.createdAt);
     const recent = all.slice(-limit);
     const recentIds = new Set(recent.map((item) => item.id));

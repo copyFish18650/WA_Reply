@@ -95,6 +95,45 @@ test("历史分批同步到新消息后立即回复，不等待整批历史完�
   assert.equal(session.sent.length, 1);
 });
 
+test("实时客户消息优先于已经排队的历史补回消息", async t => {
+  const { store, session, service } = fixture(t);
+  const now = Date.now();
+  for (const [id, providerChatId] of [["history-1", "old-one@c.us"], ["history-2", "old-two@c.us"]]) {
+    const chatId = conversationKey("primary", providerChatId);
+    store.upsertContact(chatId, { accountId: "primary", providerChatId, profileName: providerChatId });
+    const saved = store.addMessage({ ...incoming(id, chatId, now - 60000), status: "history" }).message;
+    service.queueMessage(saved, "历史同步消息已加入低优先级补回队列", { source: "history-sync", priority: 20 });
+  }
+
+  await service.ingest(incoming("live-priority", "live-buyer@c.us", now));
+  const queued = store.listQueuedMessages("primary");
+  assert.equal(queued[0].id, "live-priority");
+  assert.equal(service.queueSnapshot("primary").next.id, "live-priority");
+
+  service.setAccountAutomation("primary", true);
+  await settle(service);
+  assert.equal(session.sent[0].chatId, "live-buyer@c.us");
+});
+
+test("待审核报价保持原状态且不会阻塞下一条可回复消息", async t => {
+  const { store, service } = fixture(t);
+  const quoteChatId = conversationKey("primary", "quote@c.us");
+  const replyChatId = conversationKey("primary", "reply@c.us");
+  store.upsertContact(quoteChatId, { accountId: "primary", providerChatId: "quote@c.us", profileName: "Quote buyer" });
+  store.upsertContact(replyChatId, { accountId: "primary", providerChatId: "reply@c.us", profileName: "Reply buyer" });
+  const image = store.addMessage({ id: "pending-image", accountId: "primary", chatId: quoteChatId, direction: "inbound", type: "image", body: "[图片]", createdAt: Date.now() - 1000 }).message;
+  const text = store.addMessage({ ...incoming("replyable", replyChatId, Date.now()), status: "received" }).message;
+  store.createQuote({ chatId: quoteChatId, inboundMessageId: image.id, supplier: "微店共享货源", searchStatus: "priced", products: [], suggestedPrice: 100, basePriceCny: 100 });
+
+  service.queueMessage(image, "错误恢复队列");
+  service.queueMessage(text, "实时消息", { source: "live", priority: 0 });
+
+  const next = service.prepareNextQueuedMessage("primary");
+  assert.equal(next.id, "replyable");
+  assert.equal(store.getMessage(quoteChatId, image.id).metadata.automationState, "quote_pending");
+  assert.equal(store.getQuoteByInboundMessage(quoteChatId, image.id).status, "pending");
+});
+
 test("历史先入库、实时事件随后到达也能启动回复，重复事件不重复发送", async t => {
   const { store, session, service } = fixture(t);
   store.updateAccountAutomation("primary", { enabled: true });
@@ -150,6 +189,34 @@ test("实际断开连接时保留未发出的消息，重新连上后自动继�
   await settle(service);
   assert.equal(session.sent.length, 1);
   assert.equal(store.listQueuedMessages("primary").length, 0);
+});
+
+test("orphaned processing states reconcile to the recorded reply or handoff outcome", async t => {
+  const { store, service } = fixture(t);
+  const chatId = conversationKey("primary", "repair@c.us");
+  store.upsertContact(chatId, { accountId: "primary", providerChatId: "repair@c.us", profileName: "Repair" });
+  store.addMessage({ id: "answered", chatId, accountId: "primary", direction: "inbound", type: "text", body: "Are you human?", createdAt: 1000, metadata: { automationState: "processing" } });
+  store.addMessage({ id: "answer", chatId, accountId: "primary", direction: "outbound", type: "text", body: "I am your customer service representative.", replyToId: "answered", createdAt: 1001 });
+  store.addMessage({ id: "handoff", chatId, accountId: "primary", direction: "inbound", type: "text", body: "Please confirm this.", createdAt: 2000, metadata: { automationState: "processing" } });
+  store.requestHuman(chatId, "needs human confirmation", "handoff");
+
+  service.queueSnapshot("primary");
+
+  assert.equal(store.getMessage(chatId, "answered").metadata.automationState, "replied");
+  assert.equal(store.getMessage(chatId, "handoff").metadata.automationState, "handoff");
+  assert.equal(store.listQueuedMessages("primary").length, 0);
+});
+
+test("processing reconciliation leaves a genuinely active task untouched", async t => {
+  const { store, service } = fixture(t);
+  const chatId = conversationKey("primary", "active@c.us");
+  store.upsertContact(chatId, { accountId: "primary", providerChatId: "active@c.us" });
+  store.addMessage({ id: "active", chatId, accountId: "primary", direction: "inbound", type: "text", body: "Hello", createdAt: Date.now(), metadata: { automationState: "processing" } });
+  service.processingMessages.add(`${chatId}::active`);
+
+  service.queueSnapshot("primary");
+
+  assert.equal(store.getMessage(chatId, "active").metadata.automationState, "processing");
 });
 
 test("客户问题后面的 ManosID 标记不会吞掉问题，开启后只回复一次", async t => {

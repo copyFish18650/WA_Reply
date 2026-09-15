@@ -226,6 +226,7 @@ test("本地模型上下文会压缩到小模型窗口并保留最新消息", ()
 
 test("付款消息待人工时后续客户疲惫表达仍会得到关怀回复", async (t) => {
   const { store, session, service } = fixture(t);
+  service.ai.casualReply = async () => "";
   const base = { accountId: "primary", accountName: "Manos Amy", chatId: "care-after-payment@c.us", profileName: "Buyer", type: "text" };
   await service.ingest({ ...base, id: "care-payment", body: "How do I pay?", createdAt: 1000 });
   await service.ingest({ ...base, id: "care-message", body: "I just finished ten hours of work and I'm very tired.", createdAt: 2000 });
@@ -238,6 +239,7 @@ test("付款消息待人工时后续客户疲惫表达仍会得到关怀回复",
 
 test("闲聊关怀会遵循账号的 dear 称呼和 emoji 风格", async (t) => {
   const { store, session, service } = fixture(t);
+  service.ai.casualReply = async () => "";
   store.updateAccountStyle("primary", {
     status: "ready",
     progress: 100,
@@ -428,7 +430,7 @@ test("回复旧图片的出站消息不会误判为已回复后续客户文字",
   assert.equal(store.hasLaterOutbound(chatId, 1000, "old-image"), true);
 });
 
-test("工作台人工回复后恢复自动、顺序正确并学习非价格问答", async (t) => {
+test("工作台人工回复后恢复自动，并让 AI 结合已学习问答自然改写", async (t) => {
   const { store, session, service } = fixture(t);
   const firstChat = conversationKey("primary", "manual-learn-1@c.us");
   const future = Date.now() + 120000;
@@ -444,11 +446,15 @@ test("工作台人工回复后恢复自动、顺序正确并学习非价格问�
 
   store.updateAccountStyle("primary", { status: "ready", summary: "Use concise English replies.", progress: 100 });
   let aiCalled = false;
-  service.ai.decide = async () => { aiCalled = true; return { action: "handoff", reply: "", reason: "不应调用模型", confidence: 0 }; };
+  service.ai.decide = async (_contact, history) => {
+    aiCalled = true;
+    assert.equal(history.some((item) => item.metadata?.source === "human-knowledge" && /mainly sell clothing/i.test(item.body)), true);
+    return { action: "reply", reply: "We mainly focus on clothing and fashion accessories. What style are you looking for?", reason: "结合人工经验回答", task: "", confidence: 0.92 };
+  };
   await service.ingest({ id: "similar-question", accountId: "primary", accountName: "Manos", chatId: "manual-learn-2@c.us", profileName: "客户二", type: "text", body: "What does your factory sell?", createdAt: future + 1000 });
-  assert.equal(aiCalled, false);
-  assert.equal(session.sent.at(-1).body, "We mainly sell clothing and fashion accessories.");
-  assert.equal(store.getLatestMessage(conversationKey("primary", "manual-learn-2@c.us")).metadata.source, "human-memory");
+  assert.equal(aiCalled, true);
+  assert.match(session.sent.at(-1).body, /focus on clothing and fashion accessories/i);
+  assert.equal(store.getLatestMessage(conversationKey("primary", "manual-learn-2@c.us")).metadata.source, "ai");
 });
 
 test("人工价格回复不会加入自动学习", async (t) => {
@@ -782,6 +788,32 @@ test("ManosID 永远只作为广告标记且禁止被模型原样回发", () => 
   assert.match(result.reason, /ManosID/);
   assert.equal(messageFromMe({ from: "self@c.us", to: "buyer@c.us", id: { fromMe: false } }, "self@c.us"), true);
   assert.equal(messageFromMe({ from: "buyer@c.us", to: "self@c.us", id: { fromMe: true } }, "self@c.us"), false);
+  assert.equal(messageFromMe({ id: "true_buyer@c.us_A1" }), true);
+  assert.equal(messageFromMe({ id: { _serialized: "false_buyer@c.us_A2" } }), false);
+  assert.equal(messageFromMe({ _data: { id: { fromMe: true } } }), true);
+});
+
+test("风格学习按 WhatsApp 真实方向配对客户问题并过滤噪声与自动回复", (t) => {
+  const { store } = fixture(t);
+  const chatId = conversationKey("primary", "style-pairs@c.us");
+  store.upsertContact(chatId, { accountId: "primary", providerChatId: "style-pairs@c.us", profileName: "Buyer" });
+  const rows = [
+    { id: "false_style-pairs@c.us_Q1", direction: "outbound", body: "Would the medium size fit me?", createdAt: 100 },
+    { id: "true_style-pairs@c.us_A1", direction: "inbound", body: "It should fit nicely. If you prefer a looser fit, I would choose the large one.", createdAt: 200 },
+    { id: "true_style-pairs@c.us_NOISE1", direction: "inbound", body: "111", createdAt: 210 },
+    { id: "true_style-pairs@c.us_NOISE2", direction: "inbound", body: "[revoked]", createdAt: 220 },
+    { id: "true_style-pairs@c.us_NOISE3", direction: "inbound", body: "IBAN GB00 TEST 1234, SWIFT TESTGB2L", createdAt: 230 },
+    { id: "true_style-pairs@c.us_NOISE4", direction: "inbound", body: "https://www.manos.live", createdAt: 240 },
+    { id: "true_style-pairs@c.us_AI", direction: "inbound", body: "This automatic answer must not train the agent.", metadata: { source: "ai" }, createdAt: 250 },
+    { id: "false_style-pairs@c.us_Q2", direction: "outbound", body: "I had a difficult day at work.", createdAt: 300 },
+    { id: "true_style-pairs@c.us_A2", direction: "inbound", body: "That sounds exhausting. Put your feet up tonight—you have earned a quiet evening.", metadata: { source: "human" }, createdAt: 400 }
+  ];
+  for (const row of rows) store.addMessage({ ...row, chatId, accountId: "primary", type: "text" });
+  const samples = store.listAccountOutbound("primary", 100);
+  assert.deepEqual(samples.map((item) => item.id), ["true_style-pairs@c.us_A1", "true_style-pairs@c.us_A2"]);
+  assert.deepEqual(samples.map((item) => item.customerBody), ["Would the medium size fit me?", "I had a difficult day at work."]);
+  assert.equal(store.getMessage(chatId, "false_style-pairs@c.us_Q1").direction, "inbound");
+  assert.equal(store.getMessage(chatId, "true_style-pairs@c.us_A1").direction, "outbound");
 });
 
 test("旧 AI 回复不能成为后续回答的事实依据", () => {
@@ -910,7 +942,7 @@ test("人工新增的主营鞋服规则可以直接回答客户且不会否认�
   assert.doesNotMatch(answer, /(?:do not|don't) sell clothes/i);
 });
 
-test("人工业务规则优先于本地模型和已学习回答", async (t) => {
+test("人工业务规则作为最高优先级知识交给本地模型自然表达", async (t) => {
   const { store, session, service } = fixture(t);
   store.updateAccountStyle("primary", {
     status: "ready",
@@ -924,9 +956,10 @@ test("人工业务规则优先于本地模型和已学习回答", async (t) => {
     }]
   });
   let modelCalled = false;
-  service.ai.decide = async () => {
+  service.ai.decide = async (_contact, _history, style) => {
     modelCalled = true;
-    return { action: "reply", reply: "I don't sell clothes.", reason: "wrong", confidence: 1 };
+    assert.match(style.rules[0].text, /高奢鞋服和配饰/);
+    return { action: "reply", reply: "Yes, we do. Manos focuses on high-end shoes, clothing and accessories, with our own factory in Shenzhen.", reason: "依据人工业务规则", task: "", confidence: 0.95 };
   };
   await service.ingest({
     id: "clothes-question",
@@ -938,12 +971,12 @@ test("人工业务规则优先于本地模型和已学习回答", async (t) => {
     body: "Don't you sell clothes? I saw in the advertisement that you sell clothes.",
     createdAt: Date.now()
   });
-  assert.equal(modelCalled, false);
+  assert.equal(modelCalled, true);
   assert.equal(session.sent.length, 1);
-  assert.match(session.sent[0].body, /shoes, clothing, and accessories/);
+  assert.match(session.sent[0].body, /shoes, clothing and accessories/);
   const chatId = conversationKey("primary", "401@c.us");
   const outbound = store.listMessages(chatId, { markRead: false }).find((item) => item.direction === "outbound");
-  assert.equal(outbound.metadata.source, "account-rule");
+  assert.equal(outbound.metadata.source, "ai");
 });
 
 test("本地模型若否认人工确认的主营品类会被阻止发送", () => {
@@ -1118,11 +1151,38 @@ test("风格学习限制输入长度并保留不同时间的代表性样本", ()
   const history = Array.from({ length: 300 }, (_, index) => ({ body: `sample-${index} ${"Some history. ".repeat(100)}` }));
   const compact = compactStyleSamples(history);
   assert.equal(compact.rows.length, 300);
-  assert.equal(compact.modelSampleCount, 24);
-  assert.ok(compact.samples.length <= 2400);
+  assert.equal(compact.modelSampleCount, 40);
+  assert.ok(compact.samples.length <= 11000);
   assert.match(compact.samples, /sample-0 /);
   assert.match(compact.samples, /sample-299 /);
   assert.equal(compactStyleSamples([{ body: " " }, null]).modelSampleCount, 0);
+});
+
+test("自然闲聊会检索相近的历史人工问答作为语气示例", async (t) => {
+  const calls = [];
+  t.mock.method(require("axios"), "post", async (url, body) => {
+    calls.push({ url, body });
+    return { data: { choices: [{ message: { content: "That sounds exhausting. Put your feet up tonight—you've earned it." } }] } };
+  });
+  const ai = new LocalAI(() => ({
+    localAiProvider: "llama.cpp",
+    localAiBaseUrl: "http://127.0.0.1:11435",
+    localAiModel: "test",
+    businessName: "Manos"
+  }));
+  const reply = await ai.casualReply("I had a really difficult day at work.", {
+    summary: "Warm, concise and conversational.",
+    rules: [],
+    styleExamples: [
+      { customer: "Which size should I choose?", reply: "Tell me your usual size and I will help you compare it." },
+      { customer: "I had a difficult day at work.", reply: "That sounds exhausting. Put your feet up tonight—you have earned a quiet evening." }
+    ]
+  }, []);
+  assert.match(reply, /exhausting/i);
+  const system = calls[0].body.messages[0].content;
+  assert.match(system, /Historic human-written examples/);
+  assert.match(system, /difficult day at work/);
+  assert.match(system, /quiet evening/);
 });
 
 test("客户回复抢先处理，后台推理取消后只完成一次", async () => {
@@ -1275,6 +1335,31 @@ test("风格学习超时生成明确标注的基础风格并保留人工规则",
   assert.equal(service.styleJobs.size, 0);
 });
 
+test("历史同步完成后会后台升级旧版模型风格但不覆盖人工风格", async (t) => {
+  const { store, session, service } = fixture(t);
+  store.updateAccountStyle("primary", {
+    status: "ready",
+    summary: "Legacy learned style",
+    analysisMethod: "model",
+    analysisVersion: 0
+  });
+  let refreshOptions = null;
+  service.analyzeAccountStyle = async (_accountId, options) => {
+    refreshOptions = options;
+    return store.getAccountStyle("primary");
+  };
+  session.emit("history-complete", { accountId: "primary" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(refreshOptions, { force: true });
+
+  store.updateAccountStyle("primary", { analysisMethod: "manual", analysisVersion: 0 });
+  refreshOptions = null;
+  service.ensureAccountStyle = async () => store.getAccountStyle("primary");
+  session.emit("history-complete", { accountId: "primary" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(refreshOptions, null);
+});
+
 test("两种模型的风格学习使用独立等待时间和受限输出", async (t) => {
   const priorTimeout = process.env.LOCAL_AI_STYLE_TIMEOUT_MS;
   process.env.LOCAL_AI_STYLE_TIMEOUT_MS = "900000";
@@ -1296,13 +1381,13 @@ test("两种模型的风格学习使用独立等待时间和受限输出", async
     const analyzed = await ai.analyzeStyle(history);
     assert.equal(analyzed.analysisMethod, "model");
     assert.equal(analyzed.sampleCount, 183);
-    assert.equal(analyzed.modelSampleCount, 24);
+    assert.equal(analyzed.modelSampleCount, 40);
     assert.equal(analyzed.warning, "");
   }
   for (const call of calls) {
     assert.equal(call.options.timeout, 900000);
-    assert.ok(call.body.messages[1].content.length < 3000);
-    assert.equal(call.body.max_tokens || call.body.options.num_predict, 320);
+    assert.ok(call.body.messages[1].content.length < 12000);
+    assert.equal(call.body.max_tokens || call.body.options.num_predict, 480);
   }
 });
 
@@ -1397,10 +1482,12 @@ test("历史同步后只补回复最近且未处理的最后一条客户消息�
   const { store, session, service } = fixture(t);
   const chatId = conversationKey("primary", "800@c.us");
   store.upsertContact(chatId, { accountId: "primary", accountName: "Manos Amy", providerChatId: "800@c.us", profileName: "相册客户" });
+  store.updateAccountStyle("primary", { status: "ready", progress: 100, summary: "Warm concise English.", rules: [], persona: { completed: true, business: "Fashion", tone: "warm", personality: "helpful" } });
   store.importHistory(chatId, "相册客户", [
     { id: "album-offer", accountId: "primary", direction: "outbound", type: "text", body: "I can share my photo album with you.", createdAt: Date.now() - 120000 },
     { id: "album-now", accountId: "primary", direction: "inbound", type: "text", body: "right now", createdAt: Date.now() - 60000 }
   ]);
+  service.ai.decide = async () => ({ action: "send_catalog", reply: "Sure, take a look at these and tell me which style catches your eye.", reason: "客户确认查看相册", task: "", confidence: 0.95 });
   const first = await service.catchUpRecentInbound("primary");
   const second = await service.catchUpRecentInbound("primary");
   assert.equal(first.count, 1);
@@ -1414,13 +1501,15 @@ test("人工点击 AI 回复可处理尚未自动回复的历史消息", async (
   const { store, session, service } = fixture(t);
   const chatId = conversationKey("primary", "900@c.us");
   store.upsertContact(chatId, { accountId: "primary", providerChatId: "900@c.us", profileName: "客户", mode: "human", needsHuman: true });
+  store.updateAccountStyle("primary", { status: "ready", progress: 100, summary: "Warm concise English.", rules: [], persona: { completed: true, business: "Fashion", tone: "warm", personality: "helpful" } });
   store.importHistory(chatId, "客户", [
     { id: "offer", accountId: "primary", direction: "outbound", type: "text", body: "Would you like to see our photo album?", createdAt: Date.now() - 1000 },
     { id: "answer", accountId: "primary", direction: "inbound", type: "text", body: "yes", createdAt: Date.now() }
   ]);
+  service.ai.decide = async () => ({ action: "send_catalog", reply: "Absolutely, here are the albums I mentioned.", reason: "客户确认查看相册", task: "", confidence: 0.95 });
   await service.replyToMessage(chatId, "answer");
   assert.equal(session.sent.length, 1);
-  assert.equal(store.getMessage(chatId, "answer").metadata.automationSource, "album-follow-up");
+  assert.equal(store.getMessage(chatId, "answer").metadata.automationSource, "ai-catalog");
 });
 
 test("人工回复按钮也不能对已有后续出站消息的旧消息重复发送", async (t) => {
@@ -2321,4 +2410,107 @@ test("encrypted WhatsApp login archive can be restored from database without the
   assert.equal(fs.readFileSync(path.join(restoredPath, "Default", "IndexedDB", "login-state.bin"), "utf8"), "persisted-login-state");
   assert.equal(store.getDatabaseStatus().counts.whatsappSessions, 1);
   assert.equal(store.getDatabaseStatus().authSessions.encrypted, 1);
+});
+
+test("AI can acknowledge a factory media request before creating a human task", async (t) => {
+  const { store, session, service } = fixture(t);
+  const chatId = conversationKey("primary", "factory-album@c.us");
+  store.upsertContact(chatId, { accountId: "primary", providerChatId: "factory-album@c.us", profileName: "Album buyer", mode: "human", needsHuman: true });
+  store.updateAccountStyle("primary", { status: "ready", progress: 100, summary: "Warm and concise English.", rules: [], persona: { completed: true, gender: "female", business: "Fashion", tone: "warm", personality: "helpful" } });
+  store.importHistory(chatId, "Album buyer", [
+    { id: "factory-album", accountId: "primary", direction: "inbound", type: "text", body: "Could you show me the album of the factory", createdAt: Date.now() }
+  ]);
+  service.ai.decide = async () => ({
+    action: "reply_and_handoff",
+    reply: "Of course, dear. I’ll ask the factory for a few recent photos and send them over as soon as I have them.",
+    reason: "需要向工厂获取素材",
+    task: "向工厂索取近期照片并发给客户",
+    confidence: 0.93
+  });
+
+  const result = await service.replyToMessage(chatId, "factory-album");
+
+  assert.equal(session.sent.length, 1);
+  assert.match(session.sent[0].body, /ask the factory for a few recent photos/i);
+  assert.doesNotMatch(session.sent[0].body, /manos\.live/);
+  assert.equal(result.state, "handoff");
+  assert.equal(store.getMessage(chatId, "factory-album").metadata.automationSource, "ai-task-router");
+  assert.equal(store.listMessages(chatId, { markRead: false }).find((item) => item.direction === "outbound").metadata.source, "ai-task-acknowledgement");
+  assert.equal(store.getContact(chatId).needsHuman, true);
+  assert.match(store.getContact(chatId).escalationReason, /索取近期照片/);
+  assert.equal(store.database.listWorkflowNodes(chatId).some((node) => node.node_type === "human_handoff" && node.message_id === "factory-album"), true);
+});
+
+test("AI-generated task acknowledgement follows the customer's language", async (t) => {
+  const { store, session, service } = fixture(t);
+  const chatId = conversationKey("primary", "factory-photo-fr@c.us");
+  store.upsertContact(chatId, { accountId: "primary", providerChatId: "factory-photo-fr@c.us", profileName: "French buyer", mode: "human", needsHuman: true });
+  store.updateAccountStyle("primary", { status: "ready", progress: 100, summary: "Réponses chaleureuses et concises.", rules: [], persona: { completed: true, gender: "female", business: "Mode", tone: "chaleureux", personality: "serviable" } });
+  store.importHistory(chatId, "French buyer", [
+    { id: "factory-photo-fr", accountId: "primary", direction: "inbound", type: "text", body: "Pouvez-vous m'envoyer des photos de votre usine ?", createdAt: Date.now() }
+  ]);
+  service.ai.decide = async () => ({
+    action: "reply_and_handoff",
+    reply: "Bien sûr. Je demande à l’usine de m’envoyer quelques photos récentes et je vous les partage dès que je les reçois.",
+    reason: "需要向工厂获取素材",
+    task: "向工厂索取近期照片并发给客户",
+    confidence: 0.91
+  });
+
+  await service.replyToMessage(chatId, "factory-photo-fr");
+
+  assert.equal(session.sent.length, 1);
+  assert.match(session.sent[0].body, /^Bien sûr/);
+  assert.match(session.sent[0].body, /l’usine/);
+});
+
+test("AI can distinguish an available product catalog from factory media", async (t) => {
+  const { store, session, service } = fixture(t);
+  const chatId = conversationKey("primary", "catalog-buyer@c.us");
+  store.upsertContact(chatId, { accountId: "primary", providerChatId: "catalog-buyer@c.us", profileName: "Catalog buyer" });
+  store.updateAccountStyle("primary", { status: "ready", progress: 100, summary: "Warm and concise English.", rules: [], persona: { completed: true, business: "Fashion", tone: "warm", personality: "helpful" } });
+  service.ai.decide = async () => ({
+    action: "send_catalog",
+    reply: "Sure, have a look through these and tell me which styles catch your eye.",
+    reason: "客户索要现成商品相册",
+    task: "",
+    confidence: 0.94
+  });
+
+  await service.ingest({ id: "catalog-request", accountId: "primary", accountName: "Manos", chatId: "catalog-buyer@c.us", profileName: "Catalog buyer", type: "text", body: "Can I see your current bag collection?", createdAt: Date.now() });
+
+  assert.equal(session.sent.length, 1);
+  assert.match(session.sent[0].body, /styles catch your eye/i);
+  assert.match(session.sent[0].body, /manos\.live/);
+  assert.equal(store.getContact(chatId).needsHuman, false);
+  assert.equal(store.getMessage(chatId, "catalog-request").metadata.automationSource, "ai-catalog");
+});
+
+test("local AI exposes a semantic reply-and-handoff action instead of phrase rules", async () => {
+  const ai = new LocalAI(() => ({
+    localAiProvider: "llama.cpp",
+    localAiBaseUrl: "http://127.0.0.1:11435",
+    localAiModel: "Qwen3.5-9B-Q4_K_M",
+    businessName: "Manos",
+    businessGuidelines: "Be warm and accurate."
+  }));
+  ai.infer = async (_url, body) => {
+    assert.deepEqual(body.response_format.json_schema.schema.properties.action.enum, ["reply", "send_catalog", "reply_and_handoff", "handoff"]);
+    assert.match(body.messages[0].content, /meaning of the latest message/i);
+    return { data: { choices: [{ message: { content: JSON.stringify({
+      action: "reply_and_handoff",
+      reply: "Absolutely, I’ll ask the workshop for a short production video and come back to you once I have it.",
+      reason: "需要补充工厂视频",
+      task: "向工厂索取生产视频",
+      confidence: 0.92
+    }) } }] } };
+  };
+
+  const result = await ai.decide({ profileName: "Buyer" }, [
+    { direction: "inbound", type: "text", body: "Could you get me a short video from the workshop?" }
+  ], { summary: "Friendly and natural.", rules: [], persona: { completed: true, tone: "warm", personality: "helpful" } });
+
+  assert.equal(result.action, "reply_and_handoff");
+  assert.equal(result.task, "向工厂索取生产视频");
+  assert.match(result.reply, /production video/i);
 });

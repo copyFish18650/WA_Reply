@@ -2,7 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const EventEmitter = require("events");
 const { randomUUID } = require("crypto");
-const { isSystemChatId, isSystemConversation, isSystemNotice } = require("./message-policy");
+const { isSystemChatId, isSystemConversation, isSystemNotice, isSpamMessage } = require("./message-policy");
 
 function browserExecutable() {
   const candidates = [
@@ -55,8 +55,20 @@ function messageFromMe(message, ownId = "") {
   const to = serializedId(message?.to);
   if (own && from && from === own) return true;
   if (own && to && to === own) return false;
-  if (typeof message?.id?.fromMe === "boolean") return message.id.fromMe;
-  return Boolean(message?.fromMe);
+  const candidates = [message?.id?.fromMe, message?.fromMe, message?._data?.id?.fromMe, message?.__x_id?.fromMe];
+  for (const value of candidates) {
+    if (typeof value === "boolean") return value;
+    if (value === "true") return true;
+    if (value === "false") return false;
+  }
+  const id = messageId(message?.id);
+  if (/^true_/i.test(id)) return true;
+  if (/^false_/i.test(id)) return false;
+  return false;
+}
+
+function yieldToRealtimeWork() {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 class AccountSession extends EventEmitter {
@@ -393,7 +405,7 @@ class AccountSession extends EventEmitter {
       const normalized = await this.normalizeMessage(message, false);
       if (!this.isCurrentClient(client, generation)) return;
       if (normalized.isGroup && this.getSettings().ignoreGroups !== false) return;
-      if (isSystemConversation(normalized)) return;
+      if (isSystemConversation(normalized) || isSpamMessage(normalized)) return;
       try { const chat = await message.getChat(); await chat.sendSeen(); } catch (_) {}
       if (!this.isCurrentClient(client, generation)) return;
       if (message.hasMedia && ["image", "video"].includes(message.type)) {
@@ -491,11 +503,12 @@ class AccountSession extends EventEmitter {
         if (!this.isCurrentClient(client, generation)) throw new Error("WhatsApp 连接已切换或断开");
         const row = await this.normalizeMessage(message, true);
         if (!this.isCurrentClient(client, generation)) throw new Error("WhatsApp 连接已切换或断开");
-        if (isSystemNotice(row)) continue;
+        if (isSystemNotice(row) || isSpamMessage(row)) continue;
         if (["image", "video"].includes(row.type) && message.hasMedia) {
           try { row.media = await this.downloadMediaPayload(message, 2); } catch (error) { row.mediaError = safeError(error).message; }
         }
         normalized.push(row);
+        if (normalized.length % 12 === 0) await yieldToRealtimeWork();
       }
       return normalized;
     } catch (error) {
@@ -528,13 +541,27 @@ class AccountSession extends EventEmitter {
           const participant = wid(value.participant);
           return stanza ? `${value.fromMe ? "true" : "false"}_${remote}_${stanza}${participant ? `_${participant}` : ""}` : "";
         };
+        const isFromMe = (message) => {
+          const values = [message?.id?.fromMe, message?.fromMe, message?.__x_id?.fromMe];
+          for (const value of values) {
+            if (typeof value === "boolean") return value;
+            if (value === "true") return true;
+            if (value === "false") return false;
+          }
+          const serialized = msgId(message?.id);
+          if (/^true_/i.test(serialized)) return true;
+          if (/^false_/i.test(serialized)) return false;
+          const own = wid(window.Store?.User?.getMaybeMeUser?.() || window.Store?.Conn?.wid || window.Store?.Conn?.me);
+          const from = wid(message?.from);
+          return Boolean(own && from && own === from);
+        };
         for (const message of messages) {
           const id = msgId(message.id);
           if (!id) continue;
           unique.set(id, {
             id,
             chatId,
-            direction: message.id?.fromMe ? "outbound" : "inbound",
+            direction: isFromMe(message) ? "outbound" : "inbound",
             type: message.type === "chat" ? "text" : (message.type || "unknown"),
             body: ["image", "video"].includes(message.type)
               ? String(message.caption || (message.type === "video" ? "[历史视频]" : "[历史图片]"))
@@ -558,6 +585,7 @@ class AccountSession extends EventEmitter {
           try { next.media = await this.downloadMessageMedia(row.id); } catch (mediaError) { next.mediaError = safeError(mediaError).message; }
         }
         normalized.push(next);
+        if (normalized.length % 12 === 0) await yieldToRealtimeWork();
       }
       return normalized;
     }
@@ -610,6 +638,9 @@ class AccountSession extends EventEmitter {
       }
       completed += 1;
       this.setState({ sync: { completed, total: eligible.length, imported, errors: [...errors], mode: limit > 0 ? `最近 ${limit} 条/会话` : "全部可用历史" } });
+      // History import is background work. Yield between chats so live message
+      // events and their reply queue can run before the next sync batch starts.
+      await yieldToRealtimeWork();
     }
     const result = { completed, total: eligible.length, imported, errors, mode: limit > 0 ? `最近 ${limit} 条/会话` : "全部可用历史" };
     this.emit("history-complete", { accountId: this.accountId, accountName: this.accountName(), ...result });

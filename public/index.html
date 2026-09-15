@@ -57,9 +57,8 @@
             <aside class="conversation-column">
               <div class="column-title">
                 <div><h2>会话</h2><span id="conversationCount">0 个客户</span></div>
-                <button id="seedButton" class="tiny-button" title="生成预览数据">预览</button>
               </div>
-              <label class="conversation-account"><span>会话账号</span><select id="conversationAccount" aria-label="选择会话账号"><option value="">正在读取账号…</option></select></label>
+              <div id="conversationAccountTabs" class="conversation-account-tabs" role="tablist" aria-label="切换 WhatsApp 账号"><span class="account-tabs-loading">正在读取账号…</span></div>
               <label class="search-box">
                 <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
                 <input id="conversationSearch" placeholder="搜索客户、号码或消息" />
@@ -68,7 +67,7 @@
                 <button class="active" data-filter="all">全部</button>
                 <button data-filter="unread">未读</button>
                 <button data-filter="human">待跟进</button>
-                <button data-filter="quote">待报价</button>
+                <button data-filter="quote">待审核</button>
               </div>
               <div id="conversationList" class="conversation-list"></div>
             </aside>
@@ -221,6 +220,6 @@
 
   <div id="modal" class="modal hidden" role="dialog" aria-modal="true"><div class="modal-card"><button id="modalClose" class="modal-close">×</button><div id="modalBody"></div></div></div>
   <div id="toastStack" class="toast-stack"></div>
-  <script src="/app.js?v=20260912-auto-reply"></script>
+  <script src="/app.js?v=20260914-style-quality"></script>
 </body>
 </html>

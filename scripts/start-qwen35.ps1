@@ -1,14 +1,15 @@
 param(
-  [int]$GpuLayers = 0,
+  [int]$GpuLayers = -1,
   [int]$ContextSize = 8192,
-  [int]$Parallel = 2,
+  [int]$Parallel = 1,
   [int]$Threads = [Math]::Min(12, [Environment]::ProcessorCount)
 )
 
 $ErrorActionPreference = "Stop"
 $localAiRoot = Join-Path $env:LOCALAPPDATA "WhatsAppSalesAI\local-ai"
 $serverPath = Join-Path $localAiRoot "llama-b10809-cuda\llama-server.exe"
-if (-not (Test-Path -LiteralPath $serverPath)) {
+$usingCuda = Test-Path -LiteralPath $serverPath
+if (-not $usingCuda) {
   $serverPath = Join-Path $localAiRoot "llama-b10809-cpu\llama-server.exe"
 }
 $modelPath = Join-Path $localAiRoot "models\Qwen_Qwen3.5-9B-Q4_K_M.gguf"
@@ -19,6 +20,9 @@ if (-not (Test-Path -LiteralPath $serverPath)) {
 }
 if (-not (Test-Path -LiteralPath $modelPath)) {
   throw "Qwen3.5-9B model not found: $modelPath"
+}
+if ($GpuLayers -lt 0) {
+  $GpuLayers = if ($usingCuda) { 99 } else { 0 }
 }
 
 $listener = Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -76,5 +80,5 @@ if (-not $ready) {
   throw "Qwen3.5-9B did not become ready. Check $stderrPath"
 }
 
-Write-Output "Qwen3.5-9B is ready on http://127.0.0.1:$port (PID $($process.Id), GPU layers: $GpuLayers)."
+Write-Output "Qwen3.5-9B is ready on http://127.0.0.1:$port (PID $($process.Id), GPU layers: $GpuLayers, context: $ContextSize, parallel slots: $Parallel)."
 Write-Output "Log: $stderrPath"
